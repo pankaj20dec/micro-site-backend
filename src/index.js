@@ -10,7 +10,7 @@ import { adminPagesRouter } from "./routes/adminPages.js";
 applyMongoDnsFromEnv();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 4000;
+const PORT = Number(process.env.PORT) || 5000;
 
 const corsOriginEnv = process.env.CORS_ORIGIN;
 const corsAllowList = (corsOriginEnv || "http://localhost:3000,http://127.0.0.1:3000")
@@ -45,8 +45,8 @@ app.use((_req, res) => {
 
 async function main() {
   await connectDb();
-  app.listen(PORT, () => {
-    console.log(`API listening on http://localhost:${PORT}`);
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`API listening on port ${PORT}`);
   });
 }
 
