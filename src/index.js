@@ -6,6 +6,7 @@ import { connectDb } from "./config/db.js";
 import { authRouter } from "./routes/auth.js";
 import { publicPagesRouter } from "./routes/publicPages.js";
 import { adminPagesRouter } from "./routes/adminPages.js";
+import { contactRouter } from "./routes/contact.js";
 
 applyMongoDnsFromEnv();
 
@@ -38,6 +39,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/auth", authRouter);
 app.use("/api/pages", publicPagesRouter);
 app.use("/api/admin/pages", adminPagesRouter);
+app.use("/api/contact", contactRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
