@@ -1,23 +1,29 @@
 import "dotenv/config";
-import { applyMongoDnsFromEnv } from "./config/mongoDns.js";
 import express from "express";
 import cors from "cors";
-import { connectDb } from "./config/db.js";
+
+import { prisma } from "./config/db.js";
 import { authRouter } from "./routes/auth.js";
 import { publicPagesRouter } from "./routes/publicPages.js";
 import { adminPagesRouter } from "./routes/adminPages.js";
 import { contactRouter } from "./routes/contact.js";
-
-applyMongoDnsFromEnv();
+import { applicationRouter } from "./routes/application.js";
+import { paymentRouter } from "./routes/payment.js";
+import { adminApplicationsRouter } from "./routes/adminApplications.js";
+import { adminUsersRouter } from "./routes/adminUsers.js";
+import { adminSetupRouter } from "./routes/adminSetup.js";
+import { siteSettingsRouter } from "./routes/siteSettings.js";
+import { adminSiteSettingsRouter } from "./routes/adminSiteSettings.js";
 
 const app = express();
-const PORT = Number(process.env.PORT) || 5000;
+const PORT = Number(process.env.PORT) || 4000;
 
-const corsOriginEnv = process.env.CORS_ORIGIN;
-const corsAllowList = (corsOriginEnv || "http://localhost:3000,http://127.0.0.1:3000")
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const corsAllowList = (process.env.CORS_ORIGIN || "http://localhost:3000,http://127.0.0.1:3000")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
 app.use(
   cors({
     origin(origin, callback) {
@@ -30,23 +36,41 @@ app.use(
     credentials: true,
   })
 );
+
+// ─── Raw body for Stripe webhook signature verification ───────────────────────
+app.use("/api/payment/stripe/webhook", express.raw({ type: "application/json" }));
+
+// ─── JSON body parser for all other routes ────────────────────────────────────
 app.use(express.json());
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
-});
+// ─── Routes ──────────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 app.use("/api/auth", authRouter);
 app.use("/api/pages", publicPagesRouter);
 app.use("/api/admin/pages", adminPagesRouter);
 app.use("/api/contact", contactRouter);
+app.use("/api/application", applicationRouter);
+app.use("/api/payment", paymentRouter);
+app.use("/api/admin/applications", adminApplicationsRouter);
+app.use("/api/admin/setup", adminSetupRouter);
+app.use("/api/admin/users", adminUsersRouter);
+app.use("/api/site-settings", siteSettingsRouter);
+app.use("/api/admin/site-settings", adminSiteSettingsRouter);
 
-app.use((_req, res) => {
-  res.status(404).json({ error: "Not found" });
+app.use((_req, res) => res.status(404).json({ error: "Not found" }));
+
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled API error:", err);
+  res.status(500).json({ error: err.message ?? "Internal server error" });
 });
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 async function main() {
-  await connectDb();
+  // Verify DB connection
+  await prisma.$connect();
+  console.log("Connected to PostgreSQL");
+
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`API listening on port ${PORT}`);
   });

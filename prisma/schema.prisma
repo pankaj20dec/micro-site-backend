@@ -1,0 +1,216 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  firstName    String
+  lastName     String
+  email        String   @unique
+  passwordHash String
+  phone        String?
+  organisation String?
+  role         Role     @default(USER)
+
+  // Password reset
+  resetToken          String?   @unique
+  resetTokenExpiresAt DateTime?
+
+  applications Application[]
+  auditActions AuditLog[]    @relation("AuditActor")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Applications (multi-step registration form state) ────────────────────────
+
+model Application {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Path & progress
+  applicationType ApplicationType?
+  currentStep     Int              @default(1)
+  status          ApplicationStatus @default(DRAFT)
+
+  // Step 3 — Membership & Payment
+  membershipType        MembershipType?
+  membershipFee         Decimal?        @db.Decimal(10, 2)
+  paymentProvider       PaymentProvider?
+  paymentStatus         PaymentStatus   @default(PENDING)
+  stripePaymentIntentId String?
+  paypalOrderId         String?
+  paypalCaptureId       String?
+
+  // Step 5C — Identity Verification
+  idDocumentUrl String?
+  idVerifiedAt  DateTime?
+
+  // Step 6C — Legal Documents (DocuSign)
+  docusignEnvelopeId String?
+  docusignStatus     DocuSignStatus?
+  legalSignedAt      DateTime?
+
+  // Steps 7C + 8C — PMI Details
+  pmiRelationshipType String?
+  pmiPolicyNumber     String?
+  pmiInsurerName      String?
+  pmiPolicyStartDate  DateTime?
+  pmiPolicyEndDate    DateTime?
+
+  // Steps 11C + 12C — Claim Stages (flexible JSON)
+  stage1Data Json?
+  stage2Data Json?
+
+  // Step 14C — Risk Disclosure
+  riskAcceptedAt DateTime?
+
+  // Save & Resume
+  resumeToken          String?  @unique
+  resumeTokenExpiresAt DateTime?
+
+  evidenceFiles EvidenceFile[]
+  paymentEvents PaymentEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Evidence Files ────────────────────────────────────────────────────────────
+
+model EvidenceFile {
+  id            String      @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  fileName   String
+  fileUrl    String
+  fileSize   Int
+  mimeType   String
+
+  uploadedAt DateTime @default(now())
+}
+
+// ─── Payment Events (webhook audit trail) ─────────────────────────────────────
+
+model PaymentEvent {
+  id            String      @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  provider        PaymentProvider
+  providerEventId String          @unique
+  type            String
+  amount          Decimal         @db.Decimal(10, 2)
+  currency        String
+  status          String
+
+  createdAt DateTime @default(now())
+}
+
+// ─── CMS Pages ────────────────────────────────────────────────────────────────
+
+model Page {
+  id        String  @id @default(uuid())
+  slug      String  @unique
+  title     String
+  body      String  @default("")
+  published Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Site settings (modal popups, etc.) ───────────────────────────────────────
+
+model SiteSetting {
+  key       String @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Contact Submissions ──────────────────────────────────────────────────────
+
+model ContactSubmission {
+  id      String  @id @default(uuid())
+  name    String
+  email   String
+  subject String
+  message String
+  ip      String?
+  status  ContactStatus @default(NEW)
+
+  createdAt DateTime @default(now())
+}
+
+// ─── Admin Audit Log ──────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String  @id @default(uuid())
+  actorId    String
+  actor      User    @relation("AuditActor", fields: [actorId], references: [id])
+  action     String
+  targetId   String?
+  targetType String?
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum ApplicationType {
+  SUPPORTER
+  CLAIMANT
+}
+
+enum ApplicationStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+enum MembershipType {
+  INDIVIDUAL
+  ORGANISATION
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYPAL
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+enum DocuSignStatus {
+  SENT
+  DELIVERED
+  COMPLETED
+  DECLINED
+}
+
+enum ContactStatus {
+  NEW
+  READ
+  REPLIED
+  ARCHIVED
+}
