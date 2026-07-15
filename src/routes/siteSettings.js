@@ -5,8 +5,13 @@ import { isLayoutKey, layoutDefaults, LAYOUT_KEYS, mergeSiteHeader } from "../li
 export const siteSettingsRouter = Router();
 
 async function getSettingContent(key, defaults) {
-  const row = await prisma.siteSetting.findUnique({ where: { key } });
-  if (row?.value) return row.value;
+  try {
+    const row = await prisma.siteSetting.findUnique({ where: { key } });
+    if (row?.value) return row.value;
+  } catch (err) {
+    // Prefer built-in defaults over 500 when DB/table is unavailable.
+    console.error(`siteSetting read failed for ${key}:`, err);
+  }
   return defaults[key];
 }
 
@@ -87,21 +92,21 @@ siteSettingsRouter.get("/layout", async (_req, res) => {
 siteSettingsRouter.get("/faq", async (_req, res) => {
   try {
     const { FAQ_CONTENT_KEY } = await import("../lib/faqContent.js");
-    const row = await prisma.siteSetting.findUnique({ where: { key: FAQ_CONTENT_KEY } });
-    return res.json({ content: row?.value ?? null });
+    const content = await getSettingContent(FAQ_CONTENT_KEY, { [FAQ_CONTENT_KEY]: null });
+    return res.json({ content: content ?? null });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Failed to load FAQ content" });
+    return res.json({ content: null });
   }
 });
 
 siteSettingsRouter.get("/seo", async (_req, res) => {
   try {
     const { SEO_CONTENT_KEY } = await import("../lib/seoContent.js");
-    const row = await prisma.siteSetting.findUnique({ where: { key: SEO_CONTENT_KEY } });
-    return res.json({ content: row?.value ?? null });
+    const content = await getSettingContent(SEO_CONTENT_KEY, { [SEO_CONTENT_KEY]: null });
+    return res.json({ content: content ?? null });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Failed to load SEO settings" });
+    return res.json({ content: null });
   }
 });
