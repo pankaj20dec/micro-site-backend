@@ -32,7 +32,7 @@ echo "==> 4) Locate API app directory"
 APP_DIR="${APP_DIR:-}"
 if [[ -z "$APP_DIR" || ! -f "$APP_DIR/package.json" ]]; then
   APP_DIR=""
-  for d in /var/www/micro-site-backend /var/www/fipo-backend /home/*/micro-site-backend /root/micro-site-backend /opt/micro-site-backend; do
+  for d in /var/www/projects/micro-site-backend /var/www/micro-site-backend /var/www/fipo-backend /home/*/micro-site-backend /root/micro-site-backend /opt/micro-site-backend; do
     if [[ -f "$d/package.json" ]]; then
       APP_DIR="$d"
       break
@@ -54,6 +54,14 @@ echo "==> 5) Apply migrations + restart API"
 if [[ -f .env ]]; then
   # shellcheck disable=SC1091
   set -a; source .env; set +a
+  if [[ -n "${DATABASE_URL:-}" ]] && [[ "${DATABASE_SSL:-}" != "false" ]]; then
+    if [[ "$DATABASE_URL" == *ondigitalocean.com* ]] || [[ "$DATABASE_URL" == *sslmode=* ]] || [[ "$DATABASE_URL" == *:25060/* ]]; then
+      if ! grep -q '^DATABASE_SSL=' .env 2>/dev/null; then
+        echo "DATABASE_SSL=true" >> .env
+        echo "Added DATABASE_SSL=true for managed Postgres TLS"
+      fi
+    fi
+  fi
 else
   echo "WARNING: no .env in $APP_DIR"
 fi
