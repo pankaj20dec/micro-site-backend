@@ -44,7 +44,19 @@ app.use("/api/payment/stripe/webhook", express.raw({ type: "application/json" })
 app.use(express.json());
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
+app.get("/api/health", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return res.json({ ok: true, db: true });
+  } catch (err) {
+    console.error("Health DB check failed:", err);
+    return res.status(503).json({
+      ok: false,
+      db: false,
+      error: err?.message ?? "database unavailable",
+    });
+  }
+});
 
 app.use("/api/auth", authRouter);
 app.use("/api/pages", publicPagesRouter);
