@@ -1,47 +1,138 @@
 import nodemailer from "nodemailer";
 
 /**
- * SMTP transport. Configure via env:
- *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE
- * When SMTP is not configured we fall back to a JSON transport that
- * logs the message to the console — useful for local development.
+ * Email transport:
+ *   EMAIL_TRANSPORT=mailjet-api — HTTPS (works on DigitalOcean; SMTP port 587 is often blocked)
+ *   SMTP_HOST + SMTP_PORT      — nodemailer SMTP
+ *   (neither)                  — console stub [EMAIL:STUB]
  */
 let transporter = null;
 let usingStub = false;
+let transportMode = "stub";
+
+const EMAIL_FROM = process.env.EMAIL_FROM || "FIPO <noreply@fipo.co.uk>";
+
+function parseFromAddress(from) {
+  const match = from.match(/^(.+?)\s*<([^>]+)>$/);
+  if (match) return { name: match[1].trim(), email: match[2].trim() };
+  return { name: "", email: from.trim() };
+}
+
+function resolveTransportMode() {
+  const explicit = (process.env.EMAIL_TRANSPORT || "").trim().toLowerCase();
+  if (explicit === "mailjet-api" || explicit === "mailjet") return "mailjet-api";
+  if (explicit === "smtp") return "smtp";
+
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+  if (SMTP_HOST && SMTP_PORT) return "smtp";
+  if (SMTP_USER && SMTP_PASS && !SMTP_HOST) return "mailjet-api";
+
+  return "stub";
+}
 
 function getTransporter() {
   if (transporter) return transporter;
 
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+  transportMode = resolveTransportMode();
 
-  if (SMTP_HOST && SMTP_PORT) {
+  if (transportMode === "smtp") {
+    const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+    usingStub = false;
     transporter = nodemailer.createTransport({
       host: SMTP_HOST,
       port: Number(SMTP_PORT),
       secure: process.env.SMTP_SECURE === "true" || Number(SMTP_PORT) === 465,
       auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
     });
+    console.log(
+      `[EMAIL] SMTP transport: ${SMTP_HOST}:${SMTP_PORT} (auth=${Boolean(SMTP_USER && SMTP_PASS)})`
+    );
+  } else if (transportMode === "mailjet-api") {
+    usingStub = false;
+    console.log("[EMAIL] Mailjet API transport (HTTPS)");
   } else {
     usingStub = true;
     transporter = nodemailer.createTransport({ jsonTransport: true });
+    console.warn("[EMAIL] Not configured — emails logged only ([EMAIL:STUB])");
   }
 
   return transporter;
 }
 
-const EMAIL_FROM = process.env.EMAIL_FROM || "FIPO <noreply@fipo.co.uk>";
+function getMailjetCredentials() {
+  const apiKey = process.env.MAILJET_API_KEY || process.env.SMTP_USER;
+  const secret = process.env.MAILJET_SECRET_KEY || process.env.SMTP_PASS;
+  if (!apiKey || !secret) {
+    throw new Error("Mailjet API key and secret are required (SMTP_USER / SMTP_PASS)");
+  }
+  return { apiKey, secret };
+}
+
+async function sendViaMailjetApi({ to, subject, html, text }) {
+  const { apiKey, secret } = getMailjetCredentials();
+  const { name, email } = parseFromAddress(EMAIL_FROM);
+  const auth = Buffer.from(`${apiKey}:${secret}`).toString("base64");
+
+  const res = await fetch("https://api.mailjet.com/v3.1/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      Messages: [
+        {
+          From: { Email: email, ...(name ? { Name: name } : {}) },
+          To: [{ Email: to }],
+          Subject: subject,
+          TextPart: text,
+          HTMLPart: html,
+        },
+      ],
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const apiError =
+      data?.Messages?.[0]?.Errors?.[0]?.ErrorMessage ||
+      data?.ErrorMessage ||
+      data?.message ||
+      res.statusText;
+    throw new Error(apiError || `Mailjet API HTTP ${res.status}`);
+  }
+
+  const messageId =
+    data?.Messages?.[0]?.To?.[0]?.MessageID ||
+    data?.Messages?.[0]?.MessageID ||
+    data?.Messages?.[0]?.MessageUUID;
+
+  return { ok: true, id: messageId ? String(messageId) : undefined };
+}
 
 export async function sendMail({ to, subject, html, text }) {
-  const tx = getTransporter();
+  const mode = transportMode === "stub" ? resolveTransportMode() : transportMode;
+  transportMode = mode;
+
   try {
+    if (mode === "mailjet-api") {
+      const result = await sendViaMailjetApi({ to, subject, html, text });
+      console.log(`[EMAIL] Sent to ${to} | Subject: ${subject} | id=${result.id || "n/a"}`);
+      return result;
+    }
+
+    const tx = getTransporter();
     const info = await tx.sendMail({ from: EMAIL_FROM, to, subject, html, text });
     if (usingStub) {
       console.log(`\n[EMAIL:STUB] To: ${to} | Subject: ${subject}`);
       console.log(`[EMAIL:STUB] Body:\n${text || html}\n`);
+    } else {
+      console.log(`[EMAIL] Sent to ${to} | Subject: ${subject} | id=${info.messageId || "n/a"}`);
     }
     return { ok: true, id: info.messageId };
   } catch (err) {
     console.error("sendMail failed:", err.message);
+    if (err.response) console.error("sendMail SMTP response:", err.response);
     return { ok: false, error: err.message };
   }
 }
