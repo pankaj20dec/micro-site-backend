@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "seed-admin": "node scripts/seedSuperAdmin.mjs"
+    "seed-admin": "node scripts/seedSuperAdmin.mjs",
+    "test-email": "node scripts/testEmail.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1079.0",
