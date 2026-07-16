@@ -317,3 +317,98 @@ View your dashboard: ${dashboardUrl}
     text,
   });
 }
+
+/**
+ * Sent when the supporter registration step is completed (step 1 → step 2).
+ */
+export async function sendSupporterMemberEmail(user) {
+  const appBase = process.env.APP_BASE_URL || "http://localhost:3000";
+  const registerUrl = `${appBase}/register?form=1`;
+  const name = user.firstName ? `${user.firstName}` : "there";
+
+  const html = baseTemplate(
+    "You are now a supporter member",
+    `
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
+        Dear ${name}, you are now a supporter member of the FIPO Fair Pay Action Group.
+        Thank you for registering your support.
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
+        You can continue your registration to complete membership payment and the
+        remaining steps at any time.
+      </p>
+      <a href="${registerUrl}"
+        style="display:inline-block;background:#802B7D;color:#ffffff;text-decoration:none;
+        font-size:14px;font-weight:bold;padding:12px 28px;border-radius:8px;letter-spacing:1px;">
+        CONTINUE REGISTRATION
+      </a>
+      <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:24px 0 0;">
+        If the button doesn't work, copy and paste this link into your browser:<br/>
+        <a href="${registerUrl}" style="color:#802B7D;">${registerUrl}</a>
+      </p>
+    `
+  );
+
+  const text = `Dear ${name},
+
+You are now a supporter member of the FIPO Fair Pay Action Group.
+Thank you for registering your support.
+
+Continue your registration: ${registerUrl}
+
+— FIPO Fair Pay Action Group`;
+
+  return sendMail({
+    to: user.email,
+    subject: "You are now a supporter member",
+    html,
+    text,
+  });
+}
+
+/**
+ * Sent when a user saves their registration progress and requests a resume link.
+ */
+export async function sendSaveResumeEmail(user, resumeUrl) {
+  const name = user.firstName ? `${user.firstName}` : "there";
+
+  const html = baseTemplate(
+    "Continue your FIPO registration",
+    `
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
+        Hi ${name}, your registration progress has been saved. Use the link below
+        to return and continue where you left off. This link is valid for 7 days
+        and can be opened in any browser.
+      </p>
+      <a href="${resumeUrl}"
+        style="display:inline-block;background:#802B7D;color:#ffffff;text-decoration:none;
+        font-size:14px;font-weight:bold;padding:12px 28px;border-radius:8px;letter-spacing:1px;">
+        RESUME REGISTRATION
+      </a>
+      <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:24px 0 0;">
+        If the button doesn't work, copy and paste this link into your browser:<br/>
+        <a href="${resumeUrl}" style="color:#802B7D;">${resumeUrl}</a>
+      </p>
+      <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:16px 0 0;">
+        If you did not request this, you can safely ignore this email.
+      </p>
+    `
+  );
+
+  const text = `Hi ${name},
+
+Your registration progress has been saved. Use this link to continue where you left off (valid for 7 days):
+
+${resumeUrl}
+
+If you did not request this, you can safely ignore this email.
+
+— FIPO Fair Pay Action Group`;
+
+  return sendMail({
+    to: user.email,
+    subject: "Your FIPO registration — resume link",
+    html,
+    text,
+  });
+}
