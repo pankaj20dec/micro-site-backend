@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { resolveAppBaseUrl, registerPayPalReturnPath } from "../lib/appBaseUrl.js";
 
 export const paymentRouter = Router();
 
@@ -193,7 +194,7 @@ paymentRouter.post("/paypal/create-order", requireAuth, async (req, res) => {
 
     const amountValue = Number(membershipFee).toFixed(2);
     const currency = process.env.PAYPAL_CURRENCY || "GBP";
-    const appBase = (process.env.APP_BASE_URL || "http://localhost:3000").replace(/\/$/, "");
+    const appBase = resolveAppBaseUrl(req, req.body?.returnBaseUrl);
 
     const orderRes = await fetch(`${base}/v2/checkout/orders`, {
       method: "POST",
@@ -217,8 +218,14 @@ paymentRouter.post("/paypal/create-order", requireAuth, async (req, res) => {
           locale: currency === "USD" ? "en-US" : "en-GB",
           shipping_preference: "NO_SHIPPING",
           user_action: "PAY_NOW",
-          return_url: `${appBase}/register?form=1&paypalReturn=1`,
-          cancel_url: `${appBase}/register?form=1&paypalCancel=1`,
+          return_url: registerPayPalReturnPath(appBase, {
+            form: "1",
+            paypalReturn: "1",
+          }),
+          cancel_url: registerPayPalReturnPath(appBase, {
+            form: "1",
+            paypalCancel: "1",
+          }),
         },
       }),
     });
