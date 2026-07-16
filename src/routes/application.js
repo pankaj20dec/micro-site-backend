@@ -3,7 +3,8 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { prisma } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
-import { sendApplicationSubmittedEmail } from "../lib/mailer.js";
+import { sendApplicationSubmittedEmail, sendSupporterMemberEmail, sendSaveResumeEmail } from "../lib/mailer.js";
+import { resolveAppBaseUrl } from "../lib/appBaseUrl.js";
 
 function signToken(user) {
   const secret = process.env.JWT_SECRET;
@@ -162,6 +163,29 @@ applicationRouter.patch("/step", async (req, res) => {
       data,
     });
 
+    const nextStep =
+      currentStep !== undefined ? currentStep : application.currentStep;
+    const nextType =
+      applicationType !== undefined ? applicationType : application.applicationType;
+    const supporterStepJustCompleted =
+      nextType === "SUPPORTER" &&
+      nextStep >= 2 &&
+      application.currentStep < 2;
+
+    if (supporterStepJustCompleted) {
+      prisma.user
+        .findUnique({
+          where: { id: req.user.sub },
+          select: { firstName: true, email: true },
+        })
+        .then((user) => {
+          if (user) return sendSupporterMemberEmail(user);
+        })
+        .catch((err) =>
+          console.error("Supporter member email failed:", err?.message || err)
+        );
+    }
+
     // Send the confirmation email once, on the transition into SUBMITTED.
     if (
       normalizedStatus === "SUBMITTED" &&
@@ -190,12 +214,23 @@ applicationRouter.patch("/step", async (req, res) => {
 // POST /api/application/save-resume — generate resume token and email link
 applicationRouter.post("/save-resume", async (req, res) => {
   try {
-    const application = await prisma.application.findFirst({
-      where: { userId: req.user.sub },
-    });
+    const userId = await requireExistingUser(req, res);
+    if (!userId) return;
+
+    const [application, user] = await Promise.all([
+      prisma.application.findFirst({ where: { userId } }),
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: { firstName: true, email: true },
+      }),
+    ]);
 
     if (!application) {
       return res.status(404).json({ error: "No application found" });
+    }
+
+    if (!user?.email) {
+      return res.status(400).json({ error: "User email not found" });
     }
 
     const resumeToken = crypto.randomBytes(32).toString("hex");
@@ -206,10 +241,16 @@ applicationRouter.post("/save-resume", async (req, res) => {
       data: { resumeToken, resumeTokenExpiresAt },
     });
 
-    const resumeUrl = `${process.env.APP_BASE_URL}/register/resume/${resumeToken}`;
+    const appBase = resolveAppBaseUrl(req, req.body?.returnBaseUrl);
+    const resumeUrl = `${appBase}/register/resume/${resumeToken}`;
 
-    // TODO: replace console.log with real email (Resend/nodemailer) when API key is available
-    console.log(`[SAVE & RESUME] Link for ${req.user.email}: ${resumeUrl}`);
+    const emailResult = await sendSaveResumeEmail(user, resumeUrl);
+    if (!emailResult.ok) {
+      console.error("Save-resume email failed:", emailResult.error);
+      return res.status(502).json({
+        error: "Progress was saved but the resume email could not be sent. Please try again.",
+      });
+    }
 
     return res.json({
       success: true,
