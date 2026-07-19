@@ -11,7 +11,7 @@ import {
   deleteEvidenceFile,
   getEvidenceFileBuffer,
   parseUploadKeyFromFileKey,
-  saveEvidenceBufferLocal,
+  saveEvidenceBuffer,
   sanitizeFileName,
 } from "../lib/spacesStorage.js";
 
@@ -304,7 +304,7 @@ applicationRouter.post("/evidence/presign", async (req, res) => {
   }
 });
 
-// POST /api/application/evidence/upload — local storage fallback when Spaces is not configured
+// POST /api/application/evidence/upload — upload via API (Spaces or local; avoids browser CORS to Spaces)
 applicationRouter.post(
   "/evidence/upload",
   express.raw({ type: () => true, limit: "20mb" }),
@@ -314,6 +314,7 @@ applicationRouter.post(
       const rawName = req.headers["x-file-name"];
       const fileName = rawName ? decodeURIComponent(String(rawName)) : "upload.bin";
       const buffer = req.body;
+      const mimeType = String(req.headers["content-type"] || "application/octet-stream");
 
       if (!fileKey || fileKey.includes("..")) {
         return res.status(400).json({ error: "Invalid file key" });
@@ -330,12 +331,12 @@ applicationRouter.post(
         return res.status(403).json({ error: "Upload not allowed for this application" });
       }
 
-      await saveEvidenceBufferLocal(fileKey, buffer);
+      const storage = await saveEvidenceBuffer(fileKey, buffer, mimeType);
 
       return res.status(201).json({
         fileKey,
         fileName: sanitizeFileName(fileName),
-        storage: "local",
+        storage,
       });
     } catch (err) {
       console.error(err);

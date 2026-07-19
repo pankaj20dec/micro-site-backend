@@ -23,6 +23,12 @@ console.log(
   `Deleting user ${user.email} (id: ${user.id}) — ${user.applications.length} application(s) will cascade.`
 );
 
+await prisma.auditLog.deleteMany({
+  where: {
+    OR: [{ actorId: user.id }, { targetId: user.id }],
+  },
+});
+
 await prisma.user.delete({ where: { id: user.id } });
 
 console.log("Deleted successfully.");
