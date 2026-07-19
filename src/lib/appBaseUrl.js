@@ -39,10 +39,20 @@ function isAllowedOrigin(origin) {
  * Prefers an explicit client origin when it matches CORS_ORIGIN / APP_BASE_URL.
  */
 export function resolveAppBaseUrl(req, requestedBaseUrl) {
-  const candidates = [
-    requestedBaseUrl,
-    req?.headers?.origin,
-  ];
+  const candidates = [requestedBaseUrl, req?.headers?.origin];
+
+  const forwardedHost = req?.headers?.["x-forwarded-host"];
+  if (forwardedHost) {
+    const host = String(forwardedHost).split(",")[0].trim();
+    const proto = String(req?.headers?.["x-forwarded-proto"] || "https")
+      .split(",")[0]
+      .trim();
+    candidates.push(`${proto}://${host}`);
+  }
+
+  if (req?.headers?.host && !forwardedHost) {
+    candidates.push(`http://${String(req.headers.host).split(",")[0].trim()}`);
+  }
 
   if (req?.headers?.referer) {
     try {
