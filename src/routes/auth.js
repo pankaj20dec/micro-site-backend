@@ -96,6 +96,12 @@ authRouter.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
+    if (!user.passwordHash) {
+      return res.status(401).json({
+        error: "This account uses Google Sign-In. Please continue with Google.",
+      });
+    }
+
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) {
       return res.status(401).json({ error: "Invalid credentials" });
@@ -115,6 +121,116 @@ authRouter.post("/login", async (req, res) => {
   } catch (err) {
     console.error("Login error:", err);
     return res.status(500).json({ error: "Login failed" });
+  }
+});
+
+async function resolveGoogleProfile({ accessToken, credential }) {
+  if (credential) {
+    const res = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`
+    );
+    if (!res.ok) return null;
+    const payload = await res.json();
+    const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+    if (clientId && payload.aud !== clientId) return null;
+    if (payload.email_verified !== "true" && payload.email_verified !== true) {
+      return null;
+    }
+    const fullName = typeof payload.name === "string" ? payload.name.trim() : "";
+    const parts = fullName.split(/\s+/).filter(Boolean);
+    return {
+      googleId: payload.sub,
+      email: payload.email?.toLowerCase?.()?.trim?.() || null,
+      firstName: payload.given_name?.trim() || parts[0] || "User",
+      lastName:
+        payload.family_name?.trim() ||
+        (parts.length > 1 ? parts.slice(1).join(" ") : "Account"),
+    };
+  }
+
+  if (accessToken) {
+    const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) return null;
+    const profile = await res.json();
+    if (!profile.email || (profile.email_verified !== true && profile.email_verified !== "true")) {
+      return null;
+    }
+    const fullName = typeof profile.name === "string" ? profile.name.trim() : "";
+    const parts = fullName.split(/\s+/).filter(Boolean);
+    return {
+      googleId: profile.sub,
+      email: profile.email.toLowerCase().trim(),
+      firstName: profile.given_name?.trim() || parts[0] || "User",
+      lastName:
+        profile.family_name?.trim() ||
+        (parts.length > 1 ? parts.slice(1).join(" ") : "Account"),
+    };
+  }
+
+  return null;
+}
+
+// POST /api/auth/google — sign in / register with a Google access token or ID token
+authRouter.post("/google", async (req, res) => {
+  try {
+    const { accessToken, credential } = req.body || {};
+    if (!accessToken && !credential) {
+      return res.status(400).json({ error: "Google credential is required" });
+    }
+
+    const profile = await resolveGoogleProfile({ accessToken, credential });
+    if (!profile?.email || !profile.googleId) {
+      return res.status(401).json({ error: "Invalid or unverified Google account" });
+    }
+
+    let user = await prisma.user.findFirst({
+      where: {
+        OR: [{ googleId: profile.googleId }, { email: profile.email }],
+      },
+    });
+
+    if (user) {
+      if (!user.googleId) {
+        user = await prisma.user.update({
+          where: { id: user.id },
+          data: { googleId: profile.googleId },
+        });
+      }
+    } else {
+      user = await prisma.user.create({
+        data: {
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          email: profile.email,
+          googleId: profile.googleId,
+          role: "USER",
+          applications: {
+            create: { currentStep: 1, status: "DRAFT" },
+          },
+        },
+      });
+
+      sendWelcomeEmail(user).catch((err) =>
+        console.error("Welcome email failed:", err?.message || err)
+      );
+    }
+
+    const token = signToken(user);
+    return res.json({
+      token,
+      user: {
+        id: user.id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    console.error("Google auth error:", err);
+    return res.status(500).json({ error: "Google sign-in failed" });
   }
 });
 
