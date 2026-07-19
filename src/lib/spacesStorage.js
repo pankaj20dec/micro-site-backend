@@ -9,10 +9,11 @@ function isPlaceholder(value) {
   return !value || value === "placeholder" || value === "...";
 }
 
-function getSpacesConfig() {
+export function getSpacesConfig() {
   return {
     endpoint: process.env.DO_SPACES_ENDPOINT,
-    region: process.env.DO_SPACES_REGION || "ams3",
+    // AWS SDK requires us-east-1 for Spaces signing (even for lon1/ams3 buckets).
+    region: process.env.DO_SPACES_SDK_REGION || "us-east-1",
     bucket: process.env.DO_SPACES_BUCKET,
     accessKeyId: process.env.DO_SPACES_KEY,
     secretAccessKey: process.env.DO_SPACES_SECRET,
@@ -135,18 +136,30 @@ export async function saveEvidenceBufferLocal(fileKey, buffer) {
 
 export async function saveEvidenceBuffer(fileKey, buffer, mimeType) {
   if (isSpacesConfigured()) {
-    const { bucket } = getSpacesConfig();
+    const { bucket, endpoint } = getSpacesConfig();
     const client = getS3Client();
-    await client.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: fileKey,
-        Body: buffer,
-        ContentType: mimeType || "application/octet-stream",
-        ACL: "private",
-      })
-    );
-    return "spaces";
+    try {
+      await client.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: fileKey,
+          Body: buffer,
+          ContentType: mimeType || "application/octet-stream",
+        })
+      );
+      return "spaces";
+    } catch (err) {
+      const details = {
+        name: err.name,
+        message: err.message,
+        code: err.Code || err.code,
+        endpoint,
+        bucket,
+        fileKey,
+      };
+      console.error("Spaces upload failed:", details);
+      throw new Error(details.message || "Spaces upload failed");
+    }
   }
 
   await saveEvidenceBufferLocal(fileKey, buffer);
