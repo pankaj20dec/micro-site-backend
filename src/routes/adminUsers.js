@@ -189,7 +189,18 @@ adminUsersRouter.delete("/:id", requireSuperAdmin, async (req, res) => {
       return res.status(403).json({ error: "Cannot delete a SUPER_ADMIN account" });
     }
 
-    await prisma.user.delete({ where: { id: req.params.id } });
+    if (target.id === req.user.sub) {
+      return res.status(403).json({ error: "You cannot delete your own account" });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.auditLog.deleteMany({
+        where: {
+          OR: [{ actorId: req.params.id }, { targetId: req.params.id }],
+        },
+      });
+      await tx.user.delete({ where: { id: req.params.id } });
+    });
 
     await prisma.auditLog.create({
       data: {
@@ -204,6 +215,11 @@ adminUsersRouter.delete("/:id", requireSuperAdmin, async (req, res) => {
     return res.status(204).send();
   } catch (err) {
     if (err.code === "P2025") return res.status(404).json({ error: "Not found" });
+    if (err.code === "P2003") {
+      return res.status(409).json({
+        error: "Cannot delete user because related records still exist. Contact support.",
+      });
+    }
     console.error(err);
     return res.status(500).json({ error: "Failed to delete user" });
   }

@@ -2,7 +2,6 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const LOCAL_ROOT = path.join(process.cwd(), "uploads");
 
@@ -41,6 +40,9 @@ function getS3Client() {
       secretAccessKey: config.secretAccessKey,
     },
     forcePathStyle: false,
+    // Avoid x-amz-checksum-* query params on presigned PUT URLs (breaks Spaces CORS).
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED",
   });
 }
 
@@ -96,22 +98,15 @@ export async function createEvidenceUploadTarget({ applicationId, uploadKey, fil
   const fileKey = buildEvidenceFileKey(applicationId, normalizedUploadKey, fileName);
 
   if (isSpacesConfigured()) {
-    const { bucket } = getSpacesConfig();
-    const client = getS3Client();
-    const command = new PutObjectCommand({
-      Bucket: bucket,
-      Key: fileKey,
-      ContentType: mimeType || "application/octet-stream",
-      ACL: "private",
-    });
-    const uploadUrl = await getSignedUrl(client, command, { expiresIn: 3600 });
     return {
       fileKey,
       uploadKey: normalizedUploadKey,
-      uploadUrl,
-      method: "PUT",
+      uploadUrl: "/api/application/evidence/upload",
+      method: "POST",
       headers: {
         "Content-Type": mimeType || "application/octet-stream",
+        "X-File-Key": fileKey,
+        "X-File-Name": encodeURIComponent(fileName),
       },
       storage: "spaces",
     };
@@ -136,6 +131,26 @@ export async function saveEvidenceBufferLocal(fileKey, buffer) {
   const fullPath = getLocalPath(fileKey);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
   await fs.writeFile(fullPath, buffer);
+}
+
+export async function saveEvidenceBuffer(fileKey, buffer, mimeType) {
+  if (isSpacesConfigured()) {
+    const { bucket } = getSpacesConfig();
+    const client = getS3Client();
+    await client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: fileKey,
+        Body: buffer,
+        ContentType: mimeType || "application/octet-stream",
+        ACL: "private",
+      })
+    );
+    return "spaces";
+  }
+
+  await saveEvidenceBufferLocal(fileKey, buffer);
+  return "local";
 }
 
 export async function getEvidenceFileBuffer(fileKey) {
