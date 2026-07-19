@@ -339,8 +339,12 @@ applicationRouter.post(
         storage,
       });
     } catch (err) {
-      console.error(err);
-      return res.status(500).json({ error: "Failed to upload evidence file" });
+      console.error("Evidence upload error:", err);
+      const message =
+        process.env.NODE_ENV === "production"
+          ? "Failed to upload evidence file"
+          : err.message || "Failed to upload evidence file";
+      return res.status(500).json({ error: message });
     }
   }
 );
