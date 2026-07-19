@@ -1,10 +1,19 @@
 import { Router } from "express";
+import express from "express";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { prisma } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { sendApplicationSubmittedEmail, sendSupporterMemberEmail, sendSaveResumeEmail } from "../lib/mailer.js";
 import { resolveAppBaseUrl } from "../lib/appBaseUrl.js";
+import {
+  createEvidenceUploadTarget,
+  deleteEvidenceFile,
+  getEvidenceFileBuffer,
+  parseUploadKeyFromFileKey,
+  saveEvidenceBufferLocal,
+  sanitizeFileName,
+} from "../lib/spacesStorage.js";
 
 function signToken(user) {
   const secret = process.env.JWT_SECRET;
@@ -264,10 +273,10 @@ applicationRouter.post("/save-resume", async (req, res) => {
   }
 });
 
-// POST /api/application/evidence/presign — get a pre-signed upload URL (DigitalOcean Spaces)
+// POST /api/application/evidence/presign — get upload target (Spaces presign or local upload URL)
 applicationRouter.post("/evidence/presign", async (req, res) => {
   try {
-    const { fileName, mimeType, fileSize } = req.body || {};
+    const { fileName, mimeType, uploadKey } = req.body || {};
 
     if (!fileName || !mimeType) {
       return res.status(400).json({ error: "fileName and mimeType are required" });
@@ -281,28 +290,68 @@ applicationRouter.post("/evidence/presign", async (req, res) => {
       return res.status(404).json({ error: "No application found" });
     }
 
-    // TODO: integrate real Spaces pre-signing when DO credentials are available.
-    // For now, return a stub that tells the frontend to use a local upload endpoint.
-    const fileKey = `evidence/${application.id}/${crypto.randomBytes(8).toString("hex")}-${fileName}`;
-
-    return res.json({
-      uploadUrl: `${process.env.APP_BASE_URL}/api/application/evidence/local-upload`,
-      fileKey,
-      stub: true,
+    const target = await createEvidenceUploadTarget({
+      applicationId: application.id,
+      uploadKey: uploadKey || "general",
+      fileName,
+      mimeType,
     });
+
+    return res.json(target);
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to generate upload URL" });
   }
 });
 
+// POST /api/application/evidence/upload — local storage fallback when Spaces is not configured
+applicationRouter.post(
+  "/evidence/upload",
+  express.raw({ type: () => true, limit: "20mb" }),
+  async (req, res) => {
+    try {
+      const fileKey = String(req.headers["x-file-key"] || "");
+      const rawName = req.headers["x-file-name"];
+      const fileName = rawName ? decodeURIComponent(String(rawName)) : "upload.bin";
+      const buffer = req.body;
+
+      if (!fileKey || fileKey.includes("..")) {
+        return res.status(400).json({ error: "Invalid file key" });
+      }
+      if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        return res.status(400).json({ error: "Empty file upload" });
+      }
+
+      const userId = await requireExistingUser(req, res);
+      if (!userId) return;
+
+      const application = await prisma.application.findFirst({ where: { userId } });
+      if (!application || !fileKey.includes(application.id)) {
+        return res.status(403).json({ error: "Upload not allowed for this application" });
+      }
+
+      await saveEvidenceBufferLocal(fileKey, buffer);
+
+      return res.status(201).json({
+        fileKey,
+        fileName: sanitizeFileName(fileName),
+        storage: "local",
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: "Failed to upload evidence file" });
+    }
+  }
+);
+
 // POST /api/application/evidence — save file metadata after upload
 applicationRouter.post("/evidence", async (req, res) => {
   try {
-    const { fileName, fileUrl, fileSize, mimeType } = req.body || {};
+    const { fileName, fileUrl, fileKey, fileSize, mimeType, uploadKey } = req.body || {};
+    const storageKey = fileKey || fileUrl;
 
-    if (!fileName || !fileUrl) {
-      return res.status(400).json({ error: "fileName and fileUrl are required" });
+    if (!fileName || !storageKey) {
+      return res.status(400).json({ error: "fileName and fileKey are required" });
     }
 
     const application = await prisma.application.findFirst({
@@ -313,13 +362,21 @@ applicationRouter.post("/evidence", async (req, res) => {
       return res.status(404).json({ error: "No application found" });
     }
 
+    if (!storageKey.includes(application.id)) {
+      return res.status(403).json({ error: "File key does not belong to this application" });
+    }
+
+    const resolvedUploadKey =
+      String(uploadKey || "").trim() || parseUploadKeyFromFileKey(storageKey);
+
     const file = await prisma.evidenceFile.create({
       data: {
         applicationId: application.id,
-        fileName,
-        fileUrl,
+        fileName: sanitizeFileName(fileName),
+        fileUrl: storageKey,
         fileSize: fileSize ?? 0,
-        mimeType,
+        mimeType: mimeType || "application/octet-stream",
+        uploadKey: resolvedUploadKey,
       },
     });
 
@@ -327,6 +384,38 @@ applicationRouter.post("/evidence", async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to save file" });
+  }
+});
+
+// GET /api/application/evidence/:id/download — download stored evidence (owner only)
+applicationRouter.get("/evidence/:id/download", async (req, res) => {
+  try {
+    const userId = await requireExistingUser(req, res);
+    if (!userId) return;
+
+    const file = await prisma.evidenceFile.findUnique({
+      where: { id: req.params.id },
+      include: { application: { select: { userId: true } } },
+    });
+
+    if (!file || file.application.userId !== userId) {
+      return res.status(404).json({ error: "File not found" });
+    }
+
+    const buffer = await getEvidenceFileBuffer(file.fileUrl);
+    if (!buffer) {
+      return res.status(404).json({ error: "File not found in storage" });
+    }
+
+    res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${sanitizeFileName(file.fileName)}"`
+    );
+    return res.send(buffer);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to download file" });
   }
 });
 
@@ -342,7 +431,8 @@ applicationRouter.delete("/evidence/:id", async (req, res) => {
       return res.status(404).json({ error: "File not found" });
     }
 
-    // TODO: also delete from DigitalOcean Spaces when credentials are available
+    // Delete from storage when configured
+    await deleteEvidenceFile(file.fileUrl);
 
     await prisma.evidenceFile.delete({ where: { id: req.params.id } });
     return res.status(204).send();

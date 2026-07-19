@@ -13,7 +13,8 @@ model User {
   firstName    String
   lastName     String
   email        String   @unique
-  passwordHash String
+  passwordHash String?
+  googleId     String?  @unique
   phone        String?
   organisation String?
   role         Role     @default(USER)
@@ -95,8 +96,11 @@ model EvidenceFile {
   fileUrl    String
   fileSize   Int
   mimeType   String
+  uploadKey  String   @default("general")
 
   uploadedAt DateTime @default(now())
+
+  @@index([applicationId, uploadKey])
 }
 
 // ─── Payment Events (webhook audit trail) ─────────────────────────────────────

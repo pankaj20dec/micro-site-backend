@@ -1,6 +1,15 @@
 import { Router } from "express";
 import { prisma } from "../config/db.js";
 import { requireAdmin, requireSuperAdmin } from "../middleware/auth.js";
+import {
+  getEvidenceFileBuffer,
+  sanitizeFileName,
+} from "../lib/spacesStorage.js";
+import { syncDocusignStatusFromApi } from "../lib/docusignSync.js";
+import {
+  getEnvelopeCombinedPdf,
+  isDocusignConfigured,
+} from "../lib/docusignClient.js";
 
 export const adminApplicationsRouter = Router();
 
@@ -128,7 +137,9 @@ adminApplicationsRouter.get("/:id", requireAdmin, async (req, res) => {
 
     if (!application) return res.status(404).json({ error: "Not found" });
 
-    return res.json({ application });
+    const synced = await syncDocusignStatusFromApi(application);
+
+    return res.json({ application: synced });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to load application" });
@@ -195,3 +206,83 @@ adminApplicationsRouter.delete("/:id", requireSuperAdmin, async (req, res) => {
     return res.status(500).json({ error: "Failed to delete application" });
   }
 });
+
+adminApplicationsRouter.get(
+  "/:applicationId/docusign/download",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const application = await prisma.application.findUnique({
+        where: { id: req.params.applicationId },
+      });
+
+      if (!application) {
+        return res.status(404).json({ error: "Application not found" });
+      }
+
+      if (!application.docusignEnvelopeId) {
+        return res.status(404).json({ error: "No DocuSign envelope for this application" });
+      }
+
+      if (!isDocusignConfigured()) {
+        return res.status(503).json({ error: "DocuSign is not configured" });
+      }
+
+      const synced = await syncDocusignStatusFromApi(application);
+      if (synced.docusignStatus !== "COMPLETED") {
+        return res.status(400).json({
+          error: "Signed PDF is available only after DocuSign signing is completed",
+        });
+      }
+
+      const pdf = await getEnvelopeCombinedPdf(synced.docusignEnvelopeId);
+      if (!pdf) {
+        return res.status(404).json({ error: "Signed document not found" });
+      }
+
+      const fileName = `fipo-signed-${synced.docusignEnvelopeId.slice(0, 8)}.pdf`;
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+      return res.send(pdf);
+    } catch (err) {
+      console.error(err);
+      return res.status(err.status || 500).json({
+        error: err.message || "Failed to download signed DocuSign document",
+      });
+    }
+  }
+);
+
+adminApplicationsRouter.get(
+  "/:applicationId/evidence/:fileId/download",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const file = await prisma.evidenceFile.findFirst({
+        where: {
+          id: req.params.fileId,
+          applicationId: req.params.applicationId,
+        },
+      });
+
+      if (!file) {
+        return res.status(404).json({ error: "File not found" });
+      }
+
+      const buffer = await getEvidenceFileBuffer(file.fileUrl);
+      if (!buffer) {
+        return res.status(404).json({ error: "File not found in storage" });
+      }
+
+      res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${sanitizeFileName(file.fileName)}"`
+      );
+      return res.send(buffer);
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: "Failed to download file" });
+    }
+  }
+);

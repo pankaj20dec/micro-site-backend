@@ -88,7 +88,7 @@ paymentRouter.post(
     try {
       const Stripe = (await import("stripe")).default;
       const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-      event = stripe.webhooks.constructEvent(req.rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
     } catch (err) {
       console.error("Stripe webhook signature error:", err.message);
       return res.status(400).json({ error: "Webhook signature invalid" });

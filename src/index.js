@@ -14,6 +14,7 @@ import { adminUsersRouter } from "./routes/adminUsers.js";
 import { adminSetupRouter } from "./routes/adminSetup.js";
 import { siteSettingsRouter } from "./routes/siteSettings.js";
 import { adminSiteSettingsRouter } from "./routes/adminSiteSettings.js";
+import { docusignRouter } from "./routes/docusign.js";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
@@ -37,8 +38,9 @@ app.use(
   })
 );
 
-// ─── Raw body for Stripe webhook signature verification ───────────────────────
+// ─── Raw body for webhook signature verification ─────────────────────────────
 app.use("/api/payment/stripe/webhook", express.raw({ type: "application/json" }));
+app.use("/api/docusign/webhook", express.raw({ type: "*/*" }));
 
 // ─── JSON body parser for all other routes ────────────────────────────────────
 app.use(express.json());
@@ -64,6 +66,7 @@ app.use("/api/admin/pages", adminPagesRouter);
 app.use("/api/contact", contactRouter);
 app.use("/api/application", applicationRouter);
 app.use("/api/payment", paymentRouter);
+app.use("/api/docusign", docusignRouter);
 app.use("/api/admin/applications", adminApplicationsRouter);
 app.use("/api/admin/setup", adminSetupRouter);
 app.use("/api/admin/users", adminUsersRouter);

@@ -2,6 +2,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import { prisma } from "../config/db.js";
 import { requireAdmin, requireSuperAdmin } from "../middleware/auth.js";
+import { syncApplicationsDocusignStatus } from "../lib/docusignSync.js";
 
 export const adminUsersRouter = Router();
 
@@ -79,6 +80,8 @@ adminUsersRouter.get("/:id", requireAdmin, async (req, res) => {
     });
 
     if (!user) return res.status(404).json({ error: "Not found" });
+
+    user.applications = await syncApplicationsDocusignStatus(user.applications);
 
     return res.json({ user });
   } catch (err) {
