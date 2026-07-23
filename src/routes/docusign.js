@@ -26,6 +26,13 @@ import {
 
 export const docusignRouter = Router();
 
+function resolveDocusignOAuthRedirectUri(req, requestedBaseUrl) {
+  const custom = process.env.DOCUSIGN_OAUTH_REDIRECT_URI?.trim();
+  if (custom) return custom.replace(/\/$/, "");
+  const appBase = resolveAppBaseUrl(req, requestedBaseUrl);
+  return `${appBase}/callback`;
+}
+
 function buildReturnUrl(req, requestedBaseUrl) {
   const appBase = resolveAppBaseUrl(req, requestedBaseUrl);
   const allowedOrigins = getAllowedOrigins();
@@ -309,7 +316,7 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     console.error("DocuSign send error:", err);
 
     if (err.code === "consent_required") {
-      const redirectUri = resolveAppBaseUrl(req, req.body?.returnBaseUrl);
+      const redirectUri = resolveDocusignOAuthRedirectUri(req, req.body?.returnBaseUrl);
       return res.status(403).json({
         error: "DocuSign consent required",
         consentUrl: getDocusignConsentUrl(redirectUri),
