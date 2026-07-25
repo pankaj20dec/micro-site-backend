@@ -73,6 +73,82 @@ paymentRouter.post("/stripe/create-intent", requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/payment/stripe/confirm — verify PaymentIntent with Stripe after client checkout
+paymentRouter.post("/stripe/confirm", requireAuth, async (req, res) => {
+  try {
+    const { paymentIntentId } = req.body || {};
+
+    const application = await prisma.application.findFirst({
+      where: { userId: req.user.sub },
+    });
+
+    if (!application) {
+      return res.status(404).json({ error: "No application found" });
+    }
+
+    if (application.paymentStatus === "PAID") {
+      return res.json({ paid: true, status: "PAID" });
+    }
+
+    const intentId = paymentIntentId || application.stripePaymentIntentId;
+    if (!intentId) {
+      return res.status(400).json({ error: "No Stripe payment to confirm" });
+    }
+
+    if (!process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY === "sk_test_placeholder") {
+      await prisma.application.update({
+        where: { id: application.id },
+        data: {
+          paymentStatus: "PAID",
+          stripePaymentIntentId: intentId,
+        },
+      });
+      return res.json({ stub: true, paid: true, status: "PAID" });
+    }
+
+    const Stripe = (await import("stripe")).default;
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    const paymentIntent = await stripe.paymentIntents.retrieve(intentId);
+
+    if (paymentIntent.metadata?.applicationId !== application.id) {
+      return res.status(403).json({ error: "Payment does not belong to this application" });
+    }
+
+    if (paymentIntent.status !== "succeeded" && paymentIntent.status !== "processing") {
+      return res.status(400).json({
+        error: "Payment not completed",
+        status: paymentIntent.status,
+      });
+    }
+
+    await prisma.$transaction([
+      prisma.application.update({
+        where: { id: application.id },
+        data: {
+          paymentStatus: "PAID",
+          stripePaymentIntentId: paymentIntent.id,
+        },
+      }),
+      prisma.paymentEvent.create({
+        data: {
+          applicationId: application.id,
+          provider: "STRIPE",
+          providerEventId: paymentIntent.id,
+          type: "payment_intent.confirm",
+          amount: paymentIntent.amount / 100,
+          currency: paymentIntent.currency,
+          status: paymentIntent.status,
+        },
+      }),
+    ]);
+
+    return res.json({ paid: true, status: "PAID" });
+  } catch (err) {
+    console.error("Stripe confirm error:", err);
+    return res.status(500).json({ error: "Failed to confirm Stripe payment" });
+  }
+});
+
 // POST /api/payment/stripe/webhook — Stripe fires this when payment succeeds
 paymentRouter.post(
   "/stripe/webhook",
