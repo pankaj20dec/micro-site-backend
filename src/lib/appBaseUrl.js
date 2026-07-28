@@ -80,3 +80,39 @@ export function registerPayPalReturnPath(baseUrl, params) {
   }
   return url.toString();
 }
+
+/** Public URL DocuSign Connect should POST envelope events to. */
+export function resolveDocusignWebhookUrl() {
+  const explicit = process.env.DOCUSIGN_WEBHOOK_URL?.trim();
+  if (explicit) {
+    return explicit.replace(/\/$/, "");
+  }
+  const appBase = normalizeOrigin(process.env.APP_BASE_URL);
+  if (!appBase) return null;
+  return `${appBase}/api/docusign/webhook`;
+}
+
+export function isPublicHttpsWebhookUrl(url) {
+  if (!url) return false;
+  try {
+    return new URL(url).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** HMAC secret is set (webhook endpoint can verify inbound requests). */
+export function isDocusignWebhookSecretConfigured() {
+  const secret = process.env.DOCUSIGN_WEBHOOK_HMAC_SECRET;
+  return !!secret && secret !== "placeholder";
+}
+
+/** DocuSign will accept envelope-level Connect registration (requires public HTTPS URL). */
+export function canRegisterDocusignEnvelopeWebhook() {
+  if (!isDocusignWebhookSecretConfigured()) return false;
+  return isPublicHttpsWebhookUrl(resolveDocusignWebhookUrl());
+}
+
+export function isDocusignWebhookConfigured() {
+  return canRegisterDocusignEnvelopeWebhook();
+}

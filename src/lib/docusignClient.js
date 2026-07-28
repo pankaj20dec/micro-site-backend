@@ -1,4 +1,10 @@
 import jwt from "jsonwebtoken";
+import {
+  canRegisterDocusignEnvelopeWebhook,
+  isDocusignWebhookConfigured,
+  isDocusignWebhookSecretConfigured,
+  resolveDocusignWebhookUrl,
+} from "./appBaseUrl.js";
 
 const DEMO_AUTH_BASE = "https://account-d.docusign.com";
 const PROD_AUTH_BASE = "https://account.docusign.com";
@@ -8,6 +14,25 @@ const DEMO_API_BASE = "https://demo.docusign.net/restapi";
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
+
+/** @type {Map<string, { data: object; expiresAt: number }>} */
+const envelopeStatusCache = new Map();
+const ENVELOPE_STATUS_CACHE_MS = 60_000;
+const ENVELOPE_STATUS_CACHE_COMPLETED_MS = 5 * 60_000;
+
+export function clearEnvelopeStatusCache(envelopeId) {
+  if (envelopeId) envelopeStatusCache.delete(String(envelopeId));
+}
+
+function isRateLimitError(err) {
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    err?.status === 429 ||
+    message.includes("hourly limit") ||
+    message.includes("rate limit") ||
+    message.includes("polling calls")
+  );
+}
 
 function isPlaceholder(value) {
   return !value || value === "placeholder" || value === "...";
@@ -38,6 +63,7 @@ function getConfig() {
     privateKey: normalizePrivateKey(process.env.DOCUSIGN_PRIVATE_KEY),
     templateId: process.env.DOCUSIGN_TEMPLATE_ID,
     roleName: process.env.DOCUSIGN_TEMPLATE_ROLE_NAME || "Signer",
+    witnessRoleName: process.env.DOCUSIGN_WITNESS_ROLE_NAME || "Witness",
   };
 }
 
@@ -51,6 +77,37 @@ export function isDocusignConfigured() {
     !isPlaceholder(config.templateId)
   );
 }
+
+function buildEnvelopeEventNotification() {
+  if (!canRegisterDocusignEnvelopeWebhook()) return null;
+
+  const url = resolveDocusignWebhookUrl();
+  if (!url) return null;
+
+  return {
+    url,
+    loggingEnabled: "true",
+    requireAcknowledgment: "true",
+    includeHMAC: "true",
+    deliveryMode: "SIM",
+    eventData: {
+      version: "restv2.1",
+      format: "json",
+    },
+    events: [
+      "envelope-sent",
+      "envelope-delivered",
+      "envelope-completed",
+      "envelope-declined",
+    ],
+  };
+}
+
+export {
+  canRegisterDocusignEnvelopeWebhook,
+  isDocusignWebhookConfigured,
+  resolveDocusignWebhookUrl,
+};
 
 export function getDocusignConsentUrl(redirectUri) {
   const { integrationKey, authBase } = getConfig();
@@ -127,10 +184,22 @@ async function docusignRequest(path, options = {}) {
   }
 
   if (!res.ok) {
-    const err = new Error(data.message || data.errorCode || data.error || `DocuSign API ${res.status}`);
+    const message = data.message || data.errorCode || data.error || `DocuSign API ${res.status}`;
+    const err = new Error(message);
     err.status = res.status;
     err.code = data.errorCode || data.error;
     err.body = data;
+    err.rateLimited = isRateLimitError(err);
+    const code = String(err.code || "").toUpperCase();
+    if (
+      /invalid envelope status/i.test(String(message)) ||
+      code === "INVALID_ENVELOPE_STATUS" ||
+      code === "ENVELOPE_INVALID_STATUS"
+    ) {
+      err.code = "ENVELOPE_ALREADY_COMPLETED";
+      err.message =
+        "This document was already fully signed without a witness slot. Click Sign again in Stage 1 to start a fresh envelope with witness signing.";
+    }
     throw err;
   }
 
@@ -146,6 +215,39 @@ function listSignerRoles(template) {
   return (template.recipients?.signers || []).map((signer) => signer.roleName);
 }
 
+function resolveWitnessTemplateSigner(template, primaryRoleName, preferredWitnessRoleName) {
+  const signers = template.recipients?.signers || [];
+  if (signers.length <= 1) return null;
+
+  const isDifferentFromPrimary = (signer) =>
+    signer.roleName?.toLowerCase() !== String(primaryRoleName).toLowerCase();
+
+  const matchers = [
+    (signer) => signer.roleName === preferredWitnessRoleName,
+    (signer) =>
+      signer.roleName?.toLowerCase() === String(preferredWitnessRoleName).toLowerCase(),
+    (signer) => /witness/i.test(signer.roleName || ""),
+    (signer) => isDifferentFromPrimary(signer) && signer.routingOrder === "2",
+    (signer) => isDifferentFromPrimary(signer),
+  ];
+
+  for (const match of matchers) {
+    const found = signers.find((signer) => match(signer) && isDifferentFromPrimary(signer));
+    if (found) return found;
+  }
+
+  const sorted = [...signers].sort(
+    (a, b) => Number(a.routingOrder || 99) - Number(b.routingOrder || 99)
+  );
+  return sorted.find(isDifferentFromPrimary) || sorted[1] || null;
+}
+
+export function resolveConfiguredWitnessRoleName(template, primaryRoleName) {
+  const { witnessRoleName } = getConfig();
+  const witnessTemplate = resolveWitnessTemplateSigner(template, primaryRoleName, witnessRoleName);
+  return witnessTemplate?.roleName || witnessRoleName;
+}
+
 function resolveTemplateSigner(template, preferredRoleName) {
   const signers = template.recipients?.signers || [];
 
@@ -157,7 +259,12 @@ function resolveTemplateSigner(template, preferredRoleName) {
     throw err;
   }
 
-  const matched = signers.find((signer) => signer.roleName === preferredRoleName);
+  const matched =
+    signers.find((signer) => signer.roleName === preferredRoleName) ||
+    signers.find(
+      (signer) =>
+        signer.roleName?.toLowerCase() === String(preferredRoleName).toLowerCase()
+    );
   if (matched) return matched;
 
   if (signers.length === 1) {
@@ -170,6 +277,25 @@ function resolveTemplateSigner(template, preferredRoleName) {
   err.code = "TEMPLATE_ROLE_MISMATCH";
   err.availableRoles = listSignerRoles(template);
   throw err;
+}
+
+function resolveRequiredTextTabValue(tab, name) {
+  const existing = tab.value || tab.originalValue;
+  if (existing && String(existing).trim() && String(existing).trim() !== " ") {
+    return String(existing).trim();
+  }
+
+  const label = String(tab.tabLabel || tab.name || "").toLowerCase();
+  if (label.includes("agreement party") || label.includes("party name")) {
+    return name;
+  }
+  if (label.includes("name") || label.includes("full name")) {
+    return name;
+  }
+  if (label.includes("date")) {
+    return new Date().toLocaleDateString("en-GB");
+  }
+  return name || "N/A";
 }
 
 function buildTemplateRole(signerTemplate, { email, name, clientUserId }) {
@@ -185,7 +311,7 @@ function buildTemplateRole(signerTemplate, { email, name, clientUserId }) {
     if (tab.required === "true" || tab.required === true) {
       textTabs.push({
         tabLabel: tab.tabLabel,
-        value: tab.value || tab.originalValue || " ",
+        value: resolveRequiredTextTabValue(tab, name),
       });
     }
   }
@@ -197,25 +323,177 @@ function buildTemplateRole(signerTemplate, { email, name, clientUserId }) {
   return role;
 }
 
+async function prefillRecipientRequiredTextTabs(envelopeId, recipientId, { name }) {
+  if (!recipientId || !name?.trim()) return;
+
+  const tabs = await docusignRequest(
+    `/envelopes/${envelopeId}/recipients/${recipientId}/tabs`
+  );
+  const textTabs = (tabs.textTabs || [])
+    .filter((tab) => tab.required === "true" || tab.required === true)
+    .filter((tab) => !String(tab.value || "").trim())
+    .map((tab) => ({
+      tabId: tab.tabId,
+      value: resolveRequiredTextTabValue(tab, name),
+    }));
+
+  if (!textTabs.length) return;
+
+  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+    method: "PUT",
+    body: JSON.stringify({ textTabs }),
+  });
+}
+
+async function prefillEnvelopeRequiredTextTabs(envelopeId, { primaryName, witnessName } = {}) {
+  const signers = await getEnvelopeSigners(envelopeId);
+  const primary = signers.find((s) => s.routingOrder === "1") || signers[0];
+  const witness =
+    signers.find((s) => s.routingOrder === "2" && s.recipientId !== primary?.recipientId) ||
+    signers.find((s) => s.recipientId !== primary?.recipientId);
+
+  if (primary?.recipientId && primaryName) {
+    await prefillRecipientRequiredTextTabs(envelopeId, primary.recipientId, {
+      name: primaryName,
+    });
+  }
+  if (witness?.recipientId && witnessName) {
+    await prefillRecipientRequiredTextTabs(envelopeId, witness.recipientId, {
+      name: witnessName,
+    });
+  }
+}
+
 async function getEnvelopeSigners(envelopeId) {
   const envelope = await docusignRequest(`/envelopes/${envelopeId}?include=recipients`);
   return envelope.recipients?.signers || [];
 }
 
-async function normalizeEnvelopeSigner(envelopeId, { email, name, clientUserId }) {
+export async function cleanupStaleEnvelopeRecipients(
+  envelopeId,
+  { activeWitnessEmail } = {}
+) {
   const signers = await getEnvelopeSigners(envelopeId);
-  if (signers.length === 0) {
+  if (!signers.length) return { removed: 0 };
+
+  const primary = signers.find((s) => s.routingOrder === "1") || signers[0];
+  const activeEmail = activeWitnessEmail?.trim().toLowerCase();
+  const nonPrimary = signers.filter(
+    (signer) =>
+      signer.recipientId &&
+      String(signer.recipientId) !== String(primary?.recipientId)
+  );
+  let removed = 0;
+
+  for (const signer of nonPrimary) {
+    const email = (signer.email || "").toLowerCase();
+    if (activeEmail && email === activeEmail) continue;
+
+    const isPlaceholder = email.includes("@fipo-sign.local");
+    const isWitnessSlot =
+      String(signer.routingOrder || "") === "2" ||
+      /witness/i.test(String(signer.roleName || ""));
+    const done = isSignerDone(signer.status);
+
+    // Keep the single witness placeholder — Stage 2 updates it in place.
+    // Deleting it after the claimant signs makes DocuSign mark the envelope
+    // COMPLETED and blocks witness signing.
+    if (isWitnessSlot && nonPrimary.length === 1) {
+      continue;
+    }
+
+    // Only remove extra junk recipients (old templates / duplicates), never the
+    // sole pending witness slot.
+    if (!done && (signers.length > 2 || (isPlaceholder && nonPrimary.length > 1))) {
+      try {
+        await docusignRequest(`/envelopes/${envelopeId}/recipients/${signer.recipientId}`, {
+          method: "DELETE",
+        });
+        removed++;
+      } catch (err) {
+        console.warn("Could not remove stale DocuSign recipient:", err.message);
+      }
+    }
+  }
+
+  if (removed > 0) {
+    clearEnvelopeStatusCache(envelopeId);
+  }
+
+  return { removed };
+}
+
+export async function createSenderView(envelopeId, returnUrl) {
+  const view = await docusignRequest(`/envelopes/${envelopeId}/views/sender`, {
+    method: "POST",
+    body: JSON.stringify({ returnUrl }),
+  });
+  return view.url;
+}
+
+function pickPrimaryEnvelopeSigner(signers, preferredRoleName) {
+  if (!signers?.length) return null;
+  return (
+    signers.find((signer) => signer.routingOrder === "1") ||
+    signers.find((signer) => signer.roleName === preferredRoleName) ||
+    signers.find(
+      (signer) =>
+        signer.roleName?.toLowerCase() === String(preferredRoleName).toLowerCase()
+    ) ||
+    signers.find((signer) => (signer.tabs?.signHereTabs || []).length > 0) ||
+    signers[0]
+  );
+}
+
+async function resolvePrimaryEnvelopeSigner(envelopeId, preferredRoleName) {
+  let signers = await getEnvelopeSigners(envelopeId);
+  if (!signers.length) {
     const err = new Error("DocuSign envelope has no signers after creation.");
     err.code = "ENVELOPE_NO_SIGNERS";
     throw err;
   }
 
-  const targetEmail = email.toLowerCase();
-  const primary =
-    signers.find((signer) => (signer.tabs?.signHereTabs || []).length > 0) ||
-    signers.find((signer) => signer.routingOrder === "1") ||
-    signers[0];
+  let primary = pickPrimaryEnvelopeSigner(signers, preferredRoleName);
+  if (!primary?.recipientId) {
+    signers = await getEnvelopeSigners(envelopeId);
+    primary = pickPrimaryEnvelopeSigner(signers, preferredRoleName);
+  }
 
+  if (!primary?.recipientId) {
+    const err = new Error("Could not locate the primary signer on this DocuSign envelope.");
+    err.code = "ENVELOPE_NO_PRIMARY_SIGNER";
+    throw err;
+  }
+
+  return { primary, signers };
+}
+
+function nextRecipientId(signers) {
+  const ids = (signers || [])
+    .map((signer) => Number.parseInt(String(signer.recipientId || "0"), 10))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return String((ids.length ? Math.max(...ids) : 0) + 1);
+}
+
+function sanitizeSignHereTabs(tabs) {
+  return (tabs || []).map((tab, index) => ({
+    documentId: String(tab.documentId || "1"),
+    pageNumber: String(tab.pageNumber || "1"),
+    xPosition: String(tab.xPosition ?? "100"),
+    yPosition: String(tab.yPosition ?? "500"),
+    tabLabel: tab.tabLabel || `Witness Signature ${index + 1}`,
+  }));
+}
+
+async function normalizeEnvelopeSigner(
+  envelopeId,
+  { email, name, clientUserId },
+  { preserveAdditionalSigners = false } = {}
+) {
+  const { roleName } = getConfig();
+  const { primary, signers } = await resolvePrimaryEnvelopeSigner(envelopeId, roleName);
+
+  const targetEmail = email.toLowerCase();
   const needsPrimaryUpdate =
     primary.email?.toLowerCase() !== targetEmail ||
     primary.name !== name ||
@@ -227,23 +505,54 @@ async function normalizeEnvelopeSigner(envelopeId, { email, name, clientUserId }
       body: JSON.stringify({
         signers: [
           {
-            recipientId: primary.recipientId,
+            recipientId: String(primary.recipientId),
             email,
             name,
             clientUserId,
-            roleName: primary.roleName || "signer",
+            roleName: primary.roleName || roleName,
           },
         ],
       }),
     });
   }
 
+  if (preserveAdditionalSigners) return;
+
   for (const signer of signers) {
-    if (signer.recipientId === primary.recipientId) continue;
+    if (!signer.recipientId || signer.recipientId === primary.recipientId) continue;
     await docusignRequest(`/envelopes/${envelopeId}/recipients/${signer.recipientId}`, {
       method: "DELETE",
     });
   }
+}
+
+async function ensureWitnessSignTabs(envelopeId) {
+  const { roleName, witnessRoleName } = getConfig();
+  const template = await getTemplateDetails();
+  const resolvedWitnessRoleName = resolveConfiguredWitnessRoleName(template, roleName);
+  const { primary } = await resolvePrimaryEnvelopeSigner(envelopeId, roleName);
+  const signers = await getEnvelopeSigners(envelopeId);
+  const witness = findWitnessSigner(signers, resolvedWitnessRoleName, roleName);
+  if (!witness?.recipientId) return;
+
+  const witnessTabs = await getRecipientSignHereTabs(envelopeId, witness.recipientId);
+  if (witnessTabs.length > 0) return;
+
+  const witnessTemplate = resolveWitnessTemplateSigner(
+    template,
+    roleName,
+    resolvedWitnessRoleName
+  );
+  const templateTabs = sanitizeSignHereTabs(witnessTemplate?.tabs?.signHereTabs || []);
+  const signHereTabs =
+    templateTabs.length > 0
+      ? templateTabs
+      : await buildWitnessSignHereTabs(envelopeId, primary.recipientId);
+
+  await docusignRequest(`/envelopes/${envelopeId}/recipients/${witness.recipientId}/tabs`, {
+    method: "POST",
+    body: JSON.stringify({ signHereTabs }),
+  });
 }
 
 export async function createEnvelopeFromTemplate({
@@ -252,18 +561,8 @@ export async function createEnvelopeFromTemplate({
   clientUserId,
   documents = [],
 }) {
-  const { templateId, roleName } = getConfig();
+  const { templateId, roleName, witnessRoleName } = getConfig();
   const template = await getTemplateDetails();
-  const signers = template.recipients?.signers || [];
-
-  if (signers.length > 1) {
-    const err = new Error(
-      `Template "${template.name || templateId}" requires ${signers.length} signers (${listSignerRoles(template).join(", ")}). Use a single-signer template for now.`
-    );
-    err.code = "TEMPLATE_MULTI_SIGNER";
-    err.availableRoles = listSignerRoles(template);
-    throw err;
-  }
 
   const signerTemplate = resolveTemplateSigner(template, roleName);
   if (signerTemplate.email && signerTemplate.email.includes("@")) {
@@ -287,21 +586,47 @@ export async function createEnvelopeFromTemplate({
     clientUserId,
   });
 
+  const witnessTemplate = resolveWitnessTemplateSigner(template, roleName, witnessRoleName);
+  const templateRoles = [templateRole];
+
+  if (witnessTemplate) {
+    const safeId = String(clientUserId || "pending").replace(/[^a-zA-Z0-9]/g, "");
+    templateRoles.push(
+      buildTemplateRole(witnessTemplate, {
+        email: `witness.pending.${safeId}@fipo-sign.local`,
+        name: "Witness (pending)",
+        clientUserId: `witness-${clientUserId}`,
+      })
+    );
+  }
+
+  const preserveAdditionalSigners = templateRoles.length > 1;
+
+  const createBody = {
+    emailSubject: template.emailSubject || "Please sign your FIPO legal documents",
+    templateId,
+    templateRoles,
+    status: "created",
+  };
+  const eventNotification = buildEnvelopeEventNotification();
+  if (eventNotification) {
+    createBody.eventNotification = eventNotification;
+  }
+
   const envelope = await docusignRequest("/envelopes", {
     method: "POST",
-    body: JSON.stringify({
-      emailSubject: template.emailSubject || "Please sign your FIPO legal documents",
-      templateId,
-      templateRoles: [templateRole],
-      status: "created",
-    }),
+    body: JSON.stringify(createBody),
   });
 
-  await normalizeEnvelopeSigner(envelope.envelopeId, {
-    email: signerEmail,
-    name: signerName,
-    clientUserId,
-  });
+  await normalizeEnvelopeSigner(
+    envelope.envelopeId,
+    {
+      email: signerEmail,
+      name: signerName,
+      clientUserId,
+    },
+    { preserveAdditionalSigners }
+  );
 
   if (documents.length > 0) {
     await docusignRequest(`/envelopes/${envelope.envelopeId}/documents`, {
@@ -315,6 +640,17 @@ export async function createEnvelopeFromTemplate({
         })),
       }),
     });
+  }
+
+  if (!witnessTemplate) {
+    const safeId = String(clientUserId || "pending").replace(/[^a-zA-Z0-9]/g, "");
+    await addDynamicWitnessRecipient(envelope.envelopeId, {
+      email: `witness.pending.${safeId}@fipo-sign.local`,
+      name: "Witness (pending)",
+      clientUserId: `witness-${clientUserId}`,
+    });
+  } else {
+    await ensureWitnessSignTabs(envelope.envelopeId);
   }
 
   await docusignRequest(`/envelopes/${envelope.envelopeId}`, {
@@ -332,21 +668,348 @@ export async function createRecipientView({
   clientUserId,
   returnUrl,
 }) {
+  const { roleName } = getConfig();
+  const signers = await getEnvelopeSigners(envelopeId);
+  const primary =
+    signers.find((signer) => clientUserId && signer.clientUserId === clientUserId) ||
+    pickPrimaryEnvelopeSigner(signers, roleName) ||
+    signers.find(
+      (signer) => (signer.email || "").toLowerCase() === signerEmail.toLowerCase()
+    );
+
+  await prefillEnvelopeRequiredTextTabs(envelopeId, {
+    primaryName: signerName,
+    witnessName: signers.find((s) => s.routingOrder === "2")?.name,
+  });
+
+  const viewRequest = {
+    returnUrl,
+    authenticationMethod: "none",
+    email: signerEmail,
+    userName: signerName,
+    clientUserId,
+  };
+  if (primary?.recipientId) {
+    viewRequest.recipientId = String(primary.recipientId);
+  }
+
   const view = await docusignRequest(`/envelopes/${envelopeId}/views/recipient`, {
     method: "POST",
-    body: JSON.stringify({
-      returnUrl,
-      authenticationMethod: "none",
-      email: signerEmail,
-      userName: signerName,
-      clientUserId,
-    }),
+    body: JSON.stringify(viewRequest),
   });
 
   return view.url;
 }
 
-export async function getEnvelopeStatus(envelopeId) {
+function isSignerDone(status) {
+  const normalised = String(status || "").toLowerCase();
+  return (
+    normalised === "completed" ||
+    normalised === "signed" ||
+    normalised === "autoresponded"
+  );
+}
+
+function findWitnessSigner(signers, witnessRoleName, primaryRoleName) {
+  if (!signers?.length || signers.length <= 1) return null;
+  const primary =
+    signers.find((signer) => signer.routingOrder === "1") || signers[0];
+
+  const candidates = signers.filter((signer) => {
+    if (signer.routingOrder === "1") return false;
+    if (
+      primary?.email &&
+      signer.email &&
+      primary.email.toLowerCase() === signer.email.toLowerCase()
+    ) {
+      return false;
+    }
+    if (primary?.roleName && signer.roleName === primary.roleName && signers.length <= 2) {
+      return signer.routingOrder === "2" || /witness/i.test(signer.roleName || "");
+    }
+    return true;
+  });
+
+  if (!candidates.length) return null;
+
+  return (
+    candidates.find((signer) => signer.roleName === witnessRoleName) ||
+    candidates.find(
+      (signer) =>
+        signer.roleName?.toLowerCase() === String(witnessRoleName).toLowerCase()
+    ) ||
+    candidates.find((signer) => /witness/i.test(signer.roleName || "")) ||
+    candidates.find((signer) => signer.routingOrder === "2") ||
+    candidates.find((signer) => signer.roleName !== primaryRoleName) ||
+    null
+  );
+}
+
+export function pickWitnessRemoteSigner(signers, { witnessEmail, witnessRoleName } = {}) {
+  const primaryRoleName = getConfig().roleName;
+  const resolvedRoleName = witnessRoleName || getConfig().witnessRoleName;
+  const witness = findWitnessSigner(signers, resolvedRoleName, primaryRoleName);
+  if (!witness) return null;
+  if (
+    witnessEmail &&
+    witness.email &&
+    witness.email.toLowerCase() !== witnessEmail.trim().toLowerCase()
+  ) {
+    const byEmail = (signers || []).find(
+      (signer) =>
+        signer.routingOrder !== "1" &&
+        signer.email?.toLowerCase() === witnessEmail.trim().toLowerCase()
+    );
+    return byEmail || witness;
+  }
+  return witness;
+}
+
+async function getRecipientSignHereTabs(envelopeId, recipientId) {
+  const data = await docusignRequest(
+    `/envelopes/${envelopeId}/recipients/${recipientId}/tabs`
+  );
+  return data.signHereTabs || [];
+}
+
+async function buildWitnessSignHereTabs(envelopeId, primaryRecipientId) {
+  const primaryTabs = await getRecipientSignHereTabs(envelopeId, primaryRecipientId);
+  const yOffset = Number(process.env.DOCUSIGN_WITNESS_SIGN_Y_OFFSET || 120);
+
+  if (primaryTabs.length > 0) {
+    return sanitizeSignHereTabs(
+      primaryTabs.map((tab, index) => ({
+        documentId: tab.documentId,
+        pageNumber: tab.pageNumber,
+        xPosition: tab.xPosition,
+        yPosition: String(Number(tab.yPosition) + yOffset),
+        tabLabel: tab.tabLabel ? `Witness ${tab.tabLabel}` : `Witness Signature ${index + 1}`,
+      }))
+    );
+  }
+
+  return sanitizeSignHereTabs([
+    {
+      documentId: process.env.DOCUSIGN_WITNESS_DOCUMENT_ID || "1",
+      pageNumber: process.env.DOCUSIGN_WITNESS_SIGN_PAGE || "1",
+      xPosition: process.env.DOCUSIGN_WITNESS_SIGN_X || "100",
+      yPosition: process.env.DOCUSIGN_WITNESS_SIGN_Y || "500",
+      tabLabel: "Witness Signature",
+    },
+  ]);
+}
+
+async function addDynamicWitnessRecipient(
+  envelopeId,
+  { email, name, routingOrder = "2", clientUserId }
+) {
+  const { roleName, witnessRoleName } = getConfig();
+  const { primary, signers } = await resolvePrimaryEnvelopeSigner(envelopeId, roleName);
+
+  const existingWitness = findWitnessSigner(signers, witnessRoleName, roleName);
+  if (existingWitness?.recipientId) {
+    const witnessTabs = await getRecipientSignHereTabs(
+      envelopeId,
+      existingWitness.recipientId
+    );
+    if (witnessTabs.length === 0) {
+      const signHereTabs = await buildWitnessSignHereTabs(envelopeId, primary.recipientId);
+      await docusignRequest(
+        `/envelopes/${envelopeId}/recipients/${existingWitness.recipientId}/tabs`,
+        {
+          method: "POST",
+          body: JSON.stringify({ signHereTabs }),
+        }
+      );
+    }
+    return existingWitness.recipientId;
+  }
+
+  const recipientId = nextRecipientId(signers);
+  const signHereTabs = await buildWitnessSignHereTabs(envelopeId, primary.recipientId);
+
+  // DocuSign requires an explicit recipientId when adding signers to an envelope.
+  await docusignRequest(`/envelopes/${envelopeId}/recipients`, {
+    method: "POST",
+    body: JSON.stringify({
+      signers: [
+        {
+          recipientId,
+          email,
+          name,
+          routingOrder: String(routingOrder),
+          roleName: witnessRoleName,
+          ...(clientUserId ? { clientUserId } : {}),
+        },
+      ],
+    }),
+  });
+
+  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+    method: "POST",
+    body: JSON.stringify({ signHereTabs }),
+  });
+
+  return recipientId;
+}
+
+export async function assignWitnessRecipient(
+  envelopeId,
+  { email, name, clientUserId }
+) {
+  const { roleName, witnessRoleName } = getConfig();
+  clearEnvelopeStatusCache(envelopeId);
+
+  // Check status first — never mutate recipients on a completed envelope.
+  const envelopeStatus = await getEnvelopeStatus(envelopeId, { forceRefresh: true });
+  if (envelopeStatus.status === "COMPLETED") {
+    const template = await getTemplateDetails();
+    const resolvedWitnessRoleName = resolveConfiguredWitnessRoleName(template, roleName);
+    const witnessOnEnvelope = pickWitnessRemoteSigner(envelopeStatus.signers, {
+      witnessEmail: email,
+      witnessRoleName: resolvedWitnessRoleName,
+    });
+    const witnessAlreadyDone =
+      witnessOnEnvelope && isSignerDone(witnessOnEnvelope.status);
+    if (!witnessAlreadyDone) {
+      const err = new Error(
+        "This document was already fully signed without a witness slot. Click Sign again in Stage 1 to start a fresh envelope with witness signing."
+      );
+      err.code = "ENVELOPE_ALREADY_COMPLETED";
+      throw err;
+    }
+    return;
+  }
+
+  await cleanupStaleEnvelopeRecipients(envelopeId, { activeWitnessEmail: email });
+  const signers = await getEnvelopeSigners(envelopeId);
+  const primary =
+    signers.find((signer) => signer.routingOrder === "1") || signers[0];
+  const template = await getTemplateDetails();
+  const resolvedWitnessRoleName = resolveConfiguredWitnessRoleName(template, roleName);
+
+  if (primary && !isSignerDone(primary.status)) {
+    const err = new Error("The claimant must finish signing before the witness can sign.");
+    err.code = "CLAIMANT_SIGNING_INCOMPLETE";
+    throw err;
+  }
+
+  let witness = findWitnessSigner(signers, resolvedWitnessRoleName, roleName);
+
+  const runAssign = async () => {
+    if (!witness) {
+      await addDynamicWitnessRecipient(envelopeId, { email, name, clientUserId });
+      await ensureWitnessSignTabs(envelopeId);
+      await prefillEnvelopeRequiredTextTabs(envelopeId, {
+        primaryName: primary?.name,
+        witnessName: name,
+      });
+      return;
+    }
+
+    if (!witness.recipientId) {
+      const refreshed = await getEnvelopeSigners(envelopeId);
+      witness = findWitnessSigner(refreshed, resolvedWitnessRoleName, roleName);
+    }
+
+    if (!witness?.recipientId) {
+      await addDynamicWitnessRecipient(envelopeId, { email, name, clientUserId });
+      await ensureWitnessSignTabs(envelopeId);
+      await prefillEnvelopeRequiredTextTabs(envelopeId, {
+        primaryName: primary?.name,
+        witnessName: name,
+      });
+      return;
+    }
+
+    await docusignRequest(`/envelopes/${envelopeId}/recipients`, {
+      method: "PUT",
+      body: JSON.stringify({
+        signers: [
+          {
+            recipientId: String(witness.recipientId),
+            email,
+            name,
+            roleName: witness.roleName || resolvedWitnessRoleName,
+            ...(clientUserId ? { clientUserId } : {}),
+          },
+        ],
+      }),
+    });
+
+    await ensureWitnessSignTabs(envelopeId);
+    await prefillEnvelopeRequiredTextTabs(envelopeId, {
+      primaryName: signers.find((s) => s.routingOrder === "1")?.name,
+      witnessName: name,
+    });
+  };
+
+  try {
+    await runAssign();
+  } catch (err) {
+    if (
+      err.code === "ENVELOPE_ALREADY_COMPLETED" ||
+      /invalid envelope status/i.test(String(err.message || ""))
+    ) {
+      const mapped = new Error(
+        "This document was already fully signed without a witness slot. Click Sign again in Stage 1 to start a fresh envelope with witness signing."
+      );
+      mapped.code = "ENVELOPE_ALREADY_COMPLETED";
+      throw mapped;
+    }
+    throw err;
+  }
+}
+
+export async function createWitnessRecipientView({
+  envelopeId,
+  witnessEmail,
+  witnessName,
+  witnessClientUserId,
+  returnUrl,
+}) {
+  await ensureWitnessSignTabs(envelopeId);
+
+  const { roleName, witnessRoleName } = getConfig();
+  const template = await getTemplateDetails();
+  const resolvedWitnessRoleName = resolveConfiguredWitnessRoleName(template, roleName);
+  const signers = await getEnvelopeSigners(envelopeId);
+  const primary =
+    signers.find((signer) => signer.routingOrder === "1") || signers[0];
+  const witness =
+    pickWitnessRemoteSigner(signers, {
+      witnessEmail,
+      witnessRoleName: resolvedWitnessRoleName,
+    }) || findWitnessSigner(signers, resolvedWitnessRoleName, roleName);
+
+  await prefillEnvelopeRequiredTextTabs(envelopeId, {
+    primaryName: primary?.name,
+    witnessName: witnessName,
+  });
+
+  const viewRequest = {
+    returnUrl,
+    authenticationMethod: witnessClientUserId ? "none" : "email",
+    email: witnessEmail,
+    userName: witnessName,
+  };
+  if (witnessClientUserId) {
+    viewRequest.clientUserId = witnessClientUserId;
+  }
+  if (witness?.recipientId) {
+    viewRequest.recipientId = String(witness.recipientId);
+  }
+
+  const view = await docusignRequest(`/envelopes/${envelopeId}/views/recipient`, {
+    method: "POST",
+    body: JSON.stringify(viewRequest),
+  });
+
+  return view.url;
+}
+
+export async function getEnvelopeStatus(envelopeId, options = {}) {
+  const { forceRefresh = false } = options;
   if (!envelopeId || String(envelopeId).startsWith("stub_")) {
     return {
       status: null,
@@ -354,10 +1017,29 @@ export async function getEnvelopeStatus(envelopeId) {
       signers: [],
       multipleSigners: false,
       pendingSigners: [],
+      allSignersCompleted: false,
     };
   }
 
-  const envelope = await docusignRequest(`/envelopes/${envelopeId}?include=recipients`);
+  const cacheKey = String(envelopeId);
+  if (!forceRefresh) {
+    const cached = envelopeStatusCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+  }
+
+  let envelope;
+  try {
+    envelope = await docusignRequest(`/envelopes/${cacheKey}?include=recipients`);
+  } catch (err) {
+    if (err.rateLimited) {
+      const cached = envelopeStatusCache.get(cacheKey);
+      if (cached) return cached.data;
+    }
+    throw err;
+  }
+
   const raw = String(envelope.status || "").toUpperCase();
   const statusMap = {
     SENT: "SENT",
@@ -366,37 +1048,47 @@ export async function getEnvelopeStatus(envelopeId) {
     DECLINED: "DECLINED",
   };
 
-  const isSignerDone = (status) => {
-    const normalised = String(status || "").toLowerCase();
-    return (
-      normalised === "completed" ||
-      normalised === "signed" ||
-      normalised === "autoresponded"
-    );
-  };
+  const isSignerDoneLocal = (status) => isSignerDone(status);
 
   const signers = (envelope.recipients?.signers || []).map((signer) => ({
     name: signer.name,
     email: signer.email,
     status: String(signer.status || ""),
+    roleName: signer.roleName || null,
+    routingOrder: signer.routingOrder || null,
+    recipientId: signer.recipientId || null,
   }));
 
-  const pendingSigners = signers.filter((signer) => !isSignerDone(signer.status));
+  const pendingSigners = signers.filter((signer) => !isSignerDoneLocal(signer.status));
   const multipleSigners = signers.length > 1;
 
   const allSignersCompleted =
-    signers.length > 0 && signers.every((signer) => isSignerDone(signer.status));
+    signers.length > 0 && signers.every((signer) => isSignerDoneLocal(signer.status));
 
   const mapped = statusMap[raw] || raw;
-  const status = allSignersCompleted || mapped === "COMPLETED" ? "COMPLETED" : mapped;
+  // Use DocuSign envelope status; completedDateTime means the PDF is finalized.
+  const status =
+    mapped === "COMPLETED" || envelope.completedDateTime ? "COMPLETED" : mapped;
 
-  return {
+  const result = {
     status,
     completedDateTime: envelope.completedDateTime || null,
     signers,
     multipleSigners,
     pendingSigners,
+    allSignersCompleted,
   };
+
+  const ttl =
+    status === "COMPLETED"
+      ? ENVELOPE_STATUS_CACHE_COMPLETED_MS
+      : ENVELOPE_STATUS_CACHE_MS;
+  envelopeStatusCache.set(cacheKey, {
+    data: result,
+    expiresAt: Date.now() + ttl,
+  });
+
+  return result;
 }
 
 export async function getEnvelopeCombinedPdf(envelopeId) {
