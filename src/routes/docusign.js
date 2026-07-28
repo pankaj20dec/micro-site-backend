@@ -5,12 +5,22 @@ import { getAllowedOrigins, resolveAppBaseUrl } from "../lib/appBaseUrl.js";
 import {
   createEnvelopeFromTemplate,
   createRecipientView,
+  clearEnvelopeStatusCache,
+  cleanupStaleEnvelopeRecipients,
+  createSenderView,
+  createWitnessRecipientView,
+  assignWitnessRecipient,
   getDocusignConsentUrl,
   getEnvelopeStatus,
+  getEnvelopeCombinedPdf,
   getTemplateDetails,
+  resolveConfiguredWitnessRoleName,
+  pickWitnessRemoteSigner,
   isDocusignConfigured,
+  isDocusignWebhookConfigured,
+  resolveDocusignWebhookUrl,
 } from "../lib/docusignClient.js";
-import { syncDocusignStatusFromApi } from "../lib/docusignSync.js";
+import { syncDocusignStatusFromApi, getApplicationDocusignSnapshot } from "../lib/docusignSync.js";
 import {
   getDocusignSignatures,
   mapConnectEventToStatus,
@@ -140,7 +150,11 @@ docusignRouter.get("/template", requireAuth, async (_req, res) => {
         placeholderName: signer.name || null,
         requiredTextTabs: (signer.tabs?.textTabs || [])
           .filter((tab) => tab.required === "true" || tab.required === true)
-          .map((tab) => tab.tabLabel),
+          .map((tab) => tab.tabLabel || tab.name),
+        allTextTabs: (signer.tabs?.textTabs || []).map((tab) => ({
+          label: tab.tabLabel || tab.name,
+          required: tab.required === "true" || tab.required === true,
+        })),
         signatureTabs: (signer.tabs?.signHereTabs || []).length,
       })),
       warnings: signers
@@ -165,35 +179,81 @@ docusignRouter.get("/status", requireAuth, async (req, res) => {
     if (!loaded) return;
 
     const { user } = loaded;
-    const synced = await syncDocusignStatusFromApi(loaded.application);
+    const forceRefresh = req.query.refresh === "1";
+    const witnessEmail = String(
+      loaded.application.stage2Data?.witness?.email || ""
+    ).trim();
 
-    let signers = [];
-    let multipleSigners = false;
-    let pendingSigners = [];
-    if (synced.docusignEnvelopeId && isDocusignConfigured()) {
-      try {
-        const remote = await getEnvelopeStatus(synced.docusignEnvelopeId);
-        signers = remote.signers || [];
-        multipleSigners = !!remote.multipleSigners;
-        pendingSigners = remote.pendingSigners || [];
-      } catch {
-        // ignore — return DB state
-      }
+    if (forceRefresh && loaded.application.docusignEnvelopeId) {
+      await cleanupStaleEnvelopeRecipients(loaded.application.docusignEnvelopeId, {
+        activeWitnessEmail: witnessEmail || undefined,
+      });
     }
+
+    const { application: synced, remote, rateLimited } =
+      await getApplicationDocusignSnapshot(loaded.application, { forceRefresh });
 
     return res.json({
       envelopeId: synced.docusignEnvelopeId,
-      status: synced.docusignStatus,
+      status: remote?.status || synced.docusignStatus,
+      completedDateTime: remote?.completedDateTime || synced.legalSignedAt || null,
+      allSignersCompleted: remote?.allSignersCompleted ?? false,
       legalSignedAt: synced.legalSignedAt,
       configured: isDocusignConfigured(),
+      webhookConfigured: isDocusignWebhookConfigured(),
       signerEmail: user.email,
-      signers,
-      multipleSigners,
-      pendingSigners,
+      signers: remote?.signers || [],
+      multipleSigners: !!remote?.multipleSigners,
+      pendingSigners: remote?.pendingSigners || [],
+      rateLimited,
     });
   } catch (err) {
     console.error("DocuSign status error:", err);
     return res.status(500).json({ error: "Failed to load DocuSign status" });
+  }
+});
+
+// GET /api/docusign/download — combined signed PDF for the logged-in user's envelope
+docusignRouter.get("/download", requireAuth, async (req, res) => {
+  try {
+    const loaded = await loadApplicationForUser(req.user.sub, res);
+    if (!loaded) return;
+
+    const { application } = loaded;
+
+    if (!application.docusignEnvelopeId) {
+      return res.status(404).json({ error: "No DocuSign envelope for this application" });
+    }
+
+    if (String(application.docusignEnvelopeId).startsWith("stub_")) {
+      return res.status(404).json({ error: "Signed PDF is not available in dev stub mode" });
+    }
+
+    if (!isDocusignConfigured()) {
+      return res.status(503).json({ error: "DocuSign is not configured" });
+    }
+
+    const synced = await syncDocusignStatusFromApi(application);
+    if (synced.docusignStatus !== "COMPLETED") {
+      return res.status(400).json({
+        error: "Signed PDF is available only after DocuSign signing is completed",
+      });
+    }
+
+    const pdf = await getEnvelopeCombinedPdf(synced.docusignEnvelopeId);
+    if (!pdf) {
+      return res.status(404).json({ error: "Signed document not found" });
+    }
+
+    const fileName = `fipo-engagement-${synced.docusignEnvelopeId.slice(0, 8)}.pdf`;
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+    return res.send(pdf);
+  } catch (err) {
+    console.error("DocuSign download error:", err);
+    return res.status(err.status || 500).json({
+      error: err.message || "Failed to download signed DocuSign document",
+    });
   }
 });
 
@@ -208,8 +268,40 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     const signerName = `${user.firstName} ${user.lastName}`.trim() || user.email;
     const returnUrl = buildReturnUrl(req, req.body?.returnBaseUrl);
     const forceNew = req.body?.forceNew === true;
+    let recreateForMissingWitness = false;
 
-    if (application.docusignStatus === "COMPLETED" && !forceNew) {
+    if (
+      application.docusignStatus === "COMPLETED" &&
+      !forceNew &&
+      application.docusignEnvelopeId &&
+      isDocusignConfigured()
+    ) {
+      try {
+        const remote = await getEnvelopeStatus(application.docusignEnvelopeId);
+        const template = await getTemplateDetails();
+        const primaryRoleName = process.env.DOCUSIGN_TEMPLATE_ROLE_NAME || "Signer";
+        const witnessRoleName = resolveConfiguredWitnessRoleName(template, primaryRoleName);
+        const witness = pickWitnessRemoteSigner(remote.signers, { witnessRoleName });
+        const witnessDone =
+          witness &&
+          ["completed", "signed", "autoresponded"].includes(
+            String(witness.status || "").toLowerCase()
+          );
+        if (!witnessDone) {
+          recreateForMissingWitness = true;
+        } else {
+          return res.json({
+            envelopeId: application.docusignEnvelopeId,
+            signingUrl: null,
+            docusignStatus: application.docusignStatus,
+            legalSignedAt: application.legalSignedAt,
+            alreadyCompleted: true,
+          });
+        }
+      } catch {
+        recreateForMissingWitness = true;
+      }
+    } else if (application.docusignStatus === "COMPLETED" && !forceNew) {
       return res.json({
         envelopeId: application.docusignEnvelopeId,
         signingUrl: null,
@@ -242,6 +334,7 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     let envelopeId = application.docusignEnvelopeId;
     let needsNewEnvelope =
       forceNew ||
+      recreateForMissingWitness ||
       !envelopeId ||
       application.docusignStatus === "DECLINED" ||
       application.docusignStatus === "COMPLETED";
@@ -249,7 +342,16 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     if (!needsNewEnvelope && envelopeId && isDocusignConfigured()) {
       try {
         const remote = await getEnvelopeStatus(envelopeId);
-        if (remote.multipleSigners && remote.status !== "COMPLETED") {
+        const signerCount = remote.signers?.length ?? 0;
+        const hasStalePlaceholder = (remote.signers || []).some(
+          (signer) =>
+            String(signer.email || "").includes("@fipo-sign.local") &&
+            !["completed", "signed", "autoresponded"].includes(
+              String(signer.status || "").toLowerCase()
+            )
+        );
+        // Two signers (claimant + witness) is expected — only recreate for extra/stale recipients.
+        if ((signerCount > 2 || hasStalePlaceholder) && remote.status !== "COMPLETED") {
           needsNewEnvelope = true;
         }
       } catch {
@@ -258,18 +360,23 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     }
 
     if (needsNewEnvelope) {
-      const pmiDocuments = await loadPmiEvidenceDocuments(application.id);
-      if (pmiDocuments.length === 0) {
-        return res.status(400).json({
-          error: "Please upload your PMI evidence documents before signing with DocuSign.",
-        });
+      const attachPmiEvidence = req.body?.attachPmiEvidence !== false;
+      let documents = [];
+
+      if (attachPmiEvidence) {
+        documents = await loadPmiEvidenceDocuments(application.id);
+        if (documents.length === 0) {
+          return res.status(400).json({
+            error: "Please upload your PMI evidence documents before signing with DocuSign.",
+          });
+        }
       }
 
       envelopeId = await createEnvelopeFromTemplate({
         signerEmail: user.email,
         signerName,
         clientUserId: user.id,
-        documents: pmiDocuments,
+        documents,
       });
 
       await prisma.application.update({
@@ -353,6 +460,192 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/docusign/witness/send — assign witness on the existing envelope and return signing URL
+docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
+  try {
+    const loaded = await loadApplicationForUser(req.user.sub, res);
+    if (!loaded) return;
+
+    const { user } = loaded;
+    let application = await syncDocusignStatusFromApi(loaded.application);
+    const witnessEmail = String(req.body?.witnessEmail || "").trim();
+    const witnessName = String(req.body?.witnessName || "").trim();
+    const witnessAddress = String(req.body?.witnessAddress || "").trim();
+    const returnUrl = buildReturnUrl(req, req.body?.returnBaseUrl);
+
+    if (!witnessEmail || !witnessName) {
+      return res.status(400).json({ error: "Witness name and email are required." });
+    }
+
+    if (!application.docusignEnvelopeId) {
+      return res.status(400).json({
+        error: "No DocuSign envelope found. Complete Stage 1 signing first.",
+      });
+    }
+
+    if (!isDocusignConfigured()) {
+      return res.json({
+        stub: true,
+        envelopeId: application.docusignEnvelopeId,
+        signingUrl: null,
+        witnessStatus: "SENT",
+        message: "Dev mode: DocuSign is not configured.",
+      });
+    }
+
+    const witnessClientUserId = `witness-${req.user.sub}`;
+    clearEnvelopeStatusCache(application.docusignEnvelopeId);
+    await assignWitnessRecipient(application.docusignEnvelopeId, {
+      email: witnessEmail,
+      name: witnessName,
+      clientUserId: witnessClientUserId,
+    });
+
+    const remote = await getEnvelopeStatus(application.docusignEnvelopeId, {
+      forceRefresh: true,
+    });
+    const template = await getTemplateDetails();
+    const primaryRoleName = process.env.DOCUSIGN_TEMPLATE_ROLE_NAME || "Signer";
+    const witnessRoleName = resolveConfiguredWitnessRoleName(template, primaryRoleName);
+    const witnessSigner = pickWitnessRemoteSigner(remote.signers, {
+      witnessEmail,
+      witnessRoleName,
+    });
+    const witnessDone =
+      witnessSigner &&
+      ["completed", "signed", "autoresponded"].includes(
+        String(witnessSigner.status || "").toLowerCase()
+      );
+    const envelopeComplete = remote.status === "COMPLETED";
+
+    if (witnessDone && envelopeComplete) {
+      const synced = await syncDocusignStatusFromApi(application);
+      return res.json({
+        envelopeId: synced.docusignEnvelopeId,
+        signingUrl: null,
+        witnessStatus: witnessSigner.status,
+        docusignStatus: synced.docusignStatus,
+        alreadyCompleted: true,
+      });
+    }
+
+    const claimantName = `${user.firstName} ${user.lastName}`.trim() || user.email;
+    const claimantClientUserId = String(req.user.sub);
+    let signingUrl = null;
+    let openedAs = "witness";
+
+    try {
+      signingUrl = await createWitnessRecipientView({
+        envelopeId: application.docusignEnvelopeId,
+        witnessEmail,
+        witnessName,
+        witnessClientUserId,
+        returnUrl,
+      });
+    } catch (witnessViewErr) {
+      console.warn("Witness recipient view failed:", witnessViewErr.message);
+      if (witnessDone && !envelopeComplete) {
+        signingUrl = await createRecipientView({
+          envelopeId: application.docusignEnvelopeId,
+          signerEmail: user.email,
+          signerName: claimantName,
+          clientUserId: claimantClientUserId,
+          returnUrl,
+        });
+        openedAs = "claimant";
+      } else {
+        throw witnessViewErr;
+      }
+    }
+
+    if (!signingUrl && witnessDone && !envelopeComplete) {
+      signingUrl = await createRecipientView({
+        envelopeId: application.docusignEnvelopeId,
+        signerEmail: user.email,
+        signerName: claimantName,
+        clientUserId: claimantClientUserId,
+        returnUrl,
+      });
+      openedAs = "claimant";
+    }
+
+    if (!signingUrl && witnessDone && !envelopeComplete) {
+      try {
+        signingUrl = await createSenderView(application.docusignEnvelopeId, returnUrl);
+        openedAs = "sender";
+      } catch (senderViewErr) {
+        console.warn("Sender view failed:", senderViewErr.message);
+      }
+    }
+
+    if (!signingUrl) {
+      return res.status(400).json({
+        error:
+          "Could not reopen DocuSign. Try Refresh status, or go to Stage 1 and click Sign again to start a fresh envelope.",
+        code: "CANNOT_REOPEN_SIGNING",
+        docusignStatus: remote.status,
+        signers: remote.signers,
+      });
+    }
+
+    const stage2 =
+      application.stage2Data && typeof application.stage2Data === "object"
+        ? application.stage2Data
+        : {};
+    await prisma.application.update({
+      where: { id: application.id },
+      data: {
+        stage2Data: {
+          ...stage2,
+          witness: {
+            ...(stage2.witness ?? {}),
+            fullName: witnessName,
+            email: witnessEmail,
+            ...(witnessAddress ? { address: witnessAddress } : {}),
+          },
+        },
+      },
+    });
+
+    return res.json({
+      envelopeId: application.docusignEnvelopeId,
+      signingUrl,
+      witnessStatus: witnessSigner?.status || "SENT",
+      docusignStatus: remote.status || application.docusignStatus,
+      finalizePending: witnessDone && !envelopeComplete,
+      openedAs,
+    });
+  } catch (err) {
+    if (
+      err.code === "ENVELOPE_ALREADY_COMPLETED" ||
+      err.code === "ENVELOPE_INVALID_STATUS" ||
+      /invalid envelope status/i.test(String(err.message || ""))
+    ) {
+      const message =
+        "This document was already fully signed without a witness slot. Click Sign again in Stage 1 to start a fresh envelope with witness signing.";
+      console.warn("DocuSign witness send:", message);
+      return res.status(400).json({
+        error: message,
+        code: "ENVELOPE_ALREADY_COMPLETED",
+      });
+    }
+    if (err.code === "CLAIMANT_SIGNING_INCOMPLETE") {
+      return res.status(400).json({ error: err.message });
+    }
+    if (err.code === "TEMPLATE_WITNESS_ROLE_MISSING") {
+      return res.status(400).json({
+        error: err.message,
+        availableRoles: err.availableRoles,
+      });
+    }
+
+    console.error("DocuSign witness send error:", err);
+    return res.status(err.status || 500).json({
+      error: err.message || "Failed to start witness signing",
+    });
+  }
+});
+
 // POST /api/docusign/webhook — DocuSign Connect fires this on envelope events
 docusignRouter.post("/webhook", async (req, res) => {
   const rawBody = req.body;
@@ -404,7 +697,49 @@ docusignRouter.post("/webhook", async (req, res) => {
 
   const updateData = { docusignStatus: status };
   if (status === "COMPLETED") {
-    updateData.legalSignedAt = new Date();
+    const completedDateTime =
+      payload?.data?.envelopeSummary?.completedDateTime ||
+      payload?.data?.envelopeSummary?.statusDateTime ||
+      null;
+    updateData.legalSignedAt = completedDateTime ? new Date(completedDateTime) : new Date();
+  } else if (application.docusignStatus === "COMPLETED") {
+    updateData.legalSignedAt = null;
+  }
+
+  clearEnvelopeStatusCache(envelopeId);
+
+  if (status === "COMPLETED") {
+    try {
+      const remote = await getEnvelopeStatus(envelopeId, { forceRefresh: true });
+      const signers = remote.signers || [];
+      const allDone =
+        signers.length >= 2 &&
+        signers.every((signer) =>
+          ["completed", "signed", "autoresponded"].includes(
+            String(signer.status || "").toLowerCase()
+          )
+        );
+      if (allDone || remote.allSignersCompleted) {
+        const stage2 =
+          application.stage2Data && typeof application.stage2Data === "object"
+            ? application.stage2Data
+            : {};
+        const witness =
+          stage2.witness && typeof stage2.witness === "object" ? stage2.witness : {};
+        updateData.stage2Data = {
+          ...stage2,
+          witness: {
+            ...witness,
+            declarationSigned: true,
+          },
+        };
+      }
+    } catch (err) {
+      console.warn(
+        "DocuSign webhook: could not sync witness completion flags:",
+        err.message
+      );
+    }
   }
 
   await prisma.application.update({

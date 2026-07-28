@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 
 import { prisma } from "./config/db.js";
+import { isDocusignWebhookSecretConfigured, resolveDocusignWebhookUrl, canRegisterDocusignEnvelopeWebhook } from "./lib/appBaseUrl.js";
 import { authRouter } from "./routes/auth.js";
 import { publicPagesRouter } from "./routes/publicPages.js";
 import { adminPagesRouter } from "./routes/adminPages.js";
@@ -88,6 +89,19 @@ async function main() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`API listening on port ${PORT}`);
+    if (canRegisterDocusignEnvelopeWebhook()) {
+      console.log(`DocuSign envelope webhooks: ${resolveDocusignWebhookUrl()}`);
+    } else if (isDocusignWebhookSecretConfigured()) {
+      const webhookUrl = resolveDocusignWebhookUrl();
+      console.warn(
+        `DOCUSIGN_WEBHOOK_HMAC_SECRET is set but envelope webhooks are disabled — DocuSign requires HTTPS (current: ${webhookUrl}). ` +
+          "For local dev: unset the secret or set DOCUSIGN_WEBHOOK_URL to an https:// ngrok URL. Signing works without envelope webhooks."
+      );
+    } else {
+      console.log(
+        "DocuSign envelope webhooks off — set DOCUSIGN_WEBHOOK_HMAC_SECRET + public HTTPS DOCUSIGN_WEBHOOK_URL on production"
+      );
+    }
   });
 }
 
