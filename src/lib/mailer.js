@@ -412,3 +412,61 @@ If you did not request this, you can safely ignore this email.
     text,
   });
 }
+
+/**
+ * Email the witness a DocuSign signing link. After they finish, DocuSign
+ * redirects to the homepage (returnUrl on the recipient view).
+ */
+export async function sendWitnessSigningEmail({
+  to,
+  witnessName,
+  claimantName,
+  signingUrl,
+}) {
+  const name = witnessName?.trim() || "there";
+  const who = claimantName?.trim() || "a FIPO claimant";
+
+  const html = baseTemplate(
+    "Please sign the Litigation Management Agreement",
+    `
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
+        Hello ${name},
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
+        ${who} has asked you to witness and sign the Litigation Management Agreement
+        for the FIPO Fair Pay Action Group.
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 20px;">
+        Click the button below to review and sign in DocuSign. When you have finished,
+        you will be returned to the FIPO homepage.
+      </p>
+      <a href="${signingUrl}"
+        style="display:inline-block;background:#802B7D;color:#ffffff;text-decoration:none;
+        font-size:14px;font-weight:bold;padding:12px 28px;border-radius:8px;letter-spacing:1px;">
+        REVIEW AND SIGN
+      </a>
+      <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:24px 0 0;">
+        If the button doesn't work, copy and paste this link into your browser:<br/>
+        <a href="${signingUrl}" style="color:#802B7D;">${signingUrl}</a>
+      </p>
+    `
+  );
+
+  const text = `Hello ${name},
+
+${who} has asked you to witness and sign the Litigation Management Agreement for the FIPO Fair Pay Action Group.
+
+Open this link to review and sign in DocuSign:
+${signingUrl}
+
+When you have finished, you will be returned to the FIPO homepage.
+
+— FIPO Fair Pay Action Group`;
+
+  return sendMail({
+    to,
+    subject: "FIPO — please sign as witness",
+    html,
+    text,
+  });
+}
