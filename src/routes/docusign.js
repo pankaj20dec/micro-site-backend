@@ -7,7 +7,6 @@ import {
   createRecipientView,
   clearEnvelopeStatusCache,
   cleanupStaleEnvelopeRecipients,
-  createSenderView,
   createWitnessRecipientView,
   assignWitnessRecipient,
   getDocusignConsentUrl,
@@ -33,6 +32,7 @@ import {
   isPmiEvidenceUploadKey,
   PMI_EVIDENCE_UPLOAD_KEYS,
 } from "../lib/spacesStorage.js";
+import { sendWitnessSigningEmail } from "../lib/mailer.js";
 
 export const docusignRouter = Router();
 
@@ -66,6 +66,32 @@ function buildReturnUrl(req, requestedBaseUrl) {
   const url = new URL("/register", appBase);
   url.searchParams.set("form", "1");
   url.searchParams.set("docusign", "complete");
+  return url.toString();
+}
+
+/** After witness finishes email signing, DocuSign returns them to the homepage. */
+function buildWitnessHomeReturnUrl(req, requestedBaseUrl) {
+  const appBase = resolveAppBaseUrl(req, requestedBaseUrl);
+  const allowedOrigins = getAllowedOrigins();
+  let origin = appBase;
+
+  if (requestedBaseUrl) {
+    try {
+      const parsed = new URL(
+        requestedBaseUrl.includes("://")
+          ? requestedBaseUrl
+          : `${appBase}${requestedBaseUrl.startsWith("/") ? "" : "/"}${requestedBaseUrl}`
+      );
+      if (allowedOrigins.includes(parsed.origin)) {
+        origin = parsed.origin;
+      }
+    } catch {
+      // use appBase
+    }
+  }
+
+  const url = new URL("/", origin);
+  url.searchParams.set("docusign", "witness-complete");
   return url.toString();
 }
 
@@ -460,7 +486,9 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/docusign/witness/send — assign witness on the existing envelope and return signing URL
+// POST /api/docusign/witness/send — assign witness, email them a signing link
+// (DocuSign returns the witness to the homepage when they finish). Claimant stays
+// on the registration form and can continue.
 docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
   try {
     const loaded = await loadApplicationForUser(req.user.sub, res);
@@ -471,7 +499,7 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
     const witnessEmail = String(req.body?.witnessEmail || "").trim();
     const witnessName = String(req.body?.witnessName || "").trim();
     const witnessAddress = String(req.body?.witnessAddress || "").trim();
-    const returnUrl = buildReturnUrl(req, req.body?.returnBaseUrl);
+    const homeReturnUrl = buildWitnessHomeReturnUrl(req, req.body?.returnBaseUrl);
 
     if (!witnessEmail || !witnessName) {
       return res.status(400).json({ error: "Witness name and email are required." });
@@ -484,12 +512,32 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
     }
 
     if (!isDocusignConfigured()) {
+      const stage2Stub =
+        application.stage2Data && typeof application.stage2Data === "object"
+          ? application.stage2Data
+          : {};
+      await prisma.application.update({
+        where: { id: application.id },
+        data: {
+          stage2Data: {
+            ...stage2Stub,
+            witness: {
+              ...(stage2Stub.witness ?? {}),
+              fullName: witnessName,
+              email: witnessEmail,
+              ...(witnessAddress ? { address: witnessAddress } : {}),
+              invitationSentAt: new Date().toISOString(),
+            },
+          },
+        },
+      });
       return res.json({
         stub: true,
         envelopeId: application.docusignEnvelopeId,
         signingUrl: null,
+        emailSent: true,
         witnessStatus: "SENT",
-        message: "Dev mode: DocuSign is not configured.",
+        message: "Dev mode: DocuSign is not configured. Witness invitation recorded.",
       });
     }
 
@@ -523,68 +571,45 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
       return res.json({
         envelopeId: synced.docusignEnvelopeId,
         signingUrl: null,
+        emailSent: false,
         witnessStatus: witnessSigner.status,
         docusignStatus: synced.docusignStatus,
         alreadyCompleted: true,
       });
     }
 
-    const claimantName = `${user.firstName} ${user.lastName}`.trim() || user.email;
-    const claimantClientUserId = String(req.user.sub);
-    let signingUrl = null;
-    let openedAs = "witness";
-
-    try {
-      signingUrl = await createWitnessRecipientView({
-        envelopeId: application.docusignEnvelopeId,
-        witnessEmail,
-        witnessName,
-        witnessClientUserId,
-        returnUrl,
-      });
-    } catch (witnessViewErr) {
-      console.warn("Witness recipient view failed:", witnessViewErr.message);
-      if (witnessDone && !envelopeComplete) {
-        signingUrl = await createRecipientView({
-          envelopeId: application.docusignEnvelopeId,
-          signerEmail: user.email,
-          signerName: claimantName,
-          clientUserId: claimantClientUserId,
-          returnUrl,
-        });
-        openedAs = "claimant";
-      } else {
-        throw witnessViewErr;
-      }
-    }
-
-    if (!signingUrl && witnessDone && !envelopeComplete) {
-      signingUrl = await createRecipientView({
-        envelopeId: application.docusignEnvelopeId,
-        signerEmail: user.email,
-        signerName: claimantName,
-        clientUserId: claimantClientUserId,
-        returnUrl,
-      });
-      openedAs = "claimant";
-    }
-
-    if (!signingUrl && witnessDone && !envelopeComplete) {
-      try {
-        signingUrl = await createSenderView(application.docusignEnvelopeId, returnUrl);
-        openedAs = "sender";
-      } catch (senderViewErr) {
-        console.warn("Sender view failed:", senderViewErr.message);
-      }
-    }
+    const signingUrl = await createWitnessRecipientView({
+      envelopeId: application.docusignEnvelopeId,
+      witnessEmail,
+      witnessName,
+      witnessClientUserId,
+      returnUrl: homeReturnUrl,
+    });
 
     if (!signingUrl) {
       return res.status(400).json({
         error:
-          "Could not reopen DocuSign. Try Refresh status, or go to Stage 1 and click Sign again to start a fresh envelope.",
+          "Could not create a witness signing link. Try Refresh status, or go to Stage 1 and click Sign again.",
         code: "CANNOT_REOPEN_SIGNING",
         docusignStatus: remote.status,
         signers: remote.signers,
+      });
+    }
+
+    const claimantName = `${user.firstName} ${user.lastName}`.trim() || user.email;
+    const mailResult = await sendWitnessSigningEmail({
+      to: witnessEmail,
+      witnessName,
+      claimantName,
+      signingUrl,
+    });
+
+    if (!mailResult?.ok) {
+      return res.status(502).json({
+        error:
+          mailResult?.error ||
+          "Witness signing link was created but the invitation email could not be sent.",
+        code: "WITNESS_EMAIL_FAILED",
       });
     }
 
@@ -602,6 +627,7 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
             fullName: witnessName,
             email: witnessEmail,
             ...(witnessAddress ? { address: witnessAddress } : {}),
+            invitationSentAt: new Date().toISOString(),
           },
         },
       },
@@ -609,11 +635,11 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
 
     return res.json({
       envelopeId: application.docusignEnvelopeId,
-      signingUrl,
+      signingUrl: null,
+      emailSent: true,
       witnessStatus: witnessSigner?.status || "SENT",
       docusignStatus: remote.status || application.docusignStatus,
-      finalizePending: witnessDone && !envelopeComplete,
-      openedAs,
+      message: `A signing invitation was sent to ${witnessEmail}. You can continue your registration while they sign.`,
     });
   } catch (err) {
     if (
