@@ -241,6 +241,7 @@ export async function sendPasswordResetEmail(user, resetToken) {
       <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:16px 0 0;">
         If you didn't request this, you can safely ignore this email — your
         password will remain unchanged.
+        
       </p>
     `
   );
@@ -423,8 +424,9 @@ export async function sendWitnessSigningEmail({
   claimantName,
   signingUrl,
 }) {
-  const name = witnessName?.trim() || "there";
-  const who = claimantName?.trim() || "a FIPO claimant";
+  const name = escapeHtml(witnessName?.trim() || "there");
+  const who = escapeHtml(claimantName?.trim() || "a FIPO claimant");
+  const href = escapeHtmlAttr(String(signingUrl || "").trim());
 
   const html = baseTemplate(
     "Please sign the Litigation Management Agreement",
@@ -440,21 +442,26 @@ export async function sendWitnessSigningEmail({
         Click the button below to review and sign in DocuSign. When you have finished,
         you will be returned to the FIPO homepage.
       </p>
-      <a href="${signingUrl}"
-        style="display:inline-block;background:#802B7D;color:#ffffff;text-decoration:none;
-        font-size:14px;font-weight:bold;padding:12px 28px;border-radius:8px;letter-spacing:1px;">
-        REVIEW AND SIGN
-      </a>
-      <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:24px 0 0;">
-        If the button doesn't work, copy and paste this link into your browser:<br/>
-        <a href="${signingUrl}" style="color:#802B7D;">${signingUrl}</a>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
+        <tr>
+          <td align="center" bgcolor="#802B7D" style="border-radius:8px;background-color:#802B7D;">
+            <a href="${href}" target="_blank" rel="noopener noreferrer"
+              style="display:inline-block;background-color:#802B7D;color:#ffffff !important;text-decoration:none;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;line-height:20px;padding:14px 28px;border:1px solid #802B7D;border-radius:8px;letter-spacing:1px;">
+              REVIEW AND SIGN
+            </a>
+          </td>
+        </tr>
+      </table>
+      <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:0;">
+        If the button doesn&apos;t work, copy and paste this link into your browser:<br/>
+        <a href="${href}" target="_blank" rel="noopener noreferrer" style="color:#802B7D;word-break:break-all;">${href}</a>
       </p>
     `
   );
 
-  const text = `Hello ${name},
+  const text = `Hello ${witnessName?.trim() || "there"},
 
-${who} has asked you to witness and sign the Litigation Management Agreement for the FIPO Fair Pay Action Group.
+${claimantName?.trim() || "a FIPO claimant"} has asked you to witness and sign the Litigation Management Agreement for the FIPO Fair Pay Action Group.
 
 Open this link to review and sign in DocuSign:
 ${signingUrl}
@@ -469,4 +476,17 @@ When you have finished, you will be returned to the FIPO homepage.
     html,
     text,
   });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeHtmlAttr(value) {
+  return escapeHtml(value);
 }
