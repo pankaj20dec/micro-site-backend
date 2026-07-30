@@ -241,6 +241,7 @@ export async function sendPasswordResetEmail(user, resetToken) {
       <p style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:16px 0 0;">
         If you didn't request this, you can safely ignore this email — your
         password will remain unchanged.
+        
       </p>
     `
   );
