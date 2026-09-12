@@ -18,6 +18,8 @@ import {
   isDocusignConfigured,
   isDocusignWebhookConfigured,
   resolveDocusignWebhookUrl,
+  extractSignupAddress,
+  envelopeMissingSignupAddress,
 } from "../lib/docusignClient.js";
 import { syncDocusignStatusFromApi, getApplicationDocusignSnapshot } from "../lib/docusignSync.js";
 import {
@@ -292,6 +294,21 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     const { user } = loaded;
     let application = await syncDocusignStatusFromApi(loaded.application);
     const signerName = `${user.firstName} ${user.lastName}`.trim() || user.email;
+    const signerAddress =
+      String(req.body?.signerAddress || req.body?.address || "").trim() ||
+      extractSignupAddress(application);
+    if (signerAddress) {
+      const stage1 =
+        application.stage1Data && typeof application.stage1Data === "object"
+          ? application.stage1Data
+          : {};
+      if (String(stage1.address || "").trim() !== signerAddress) {
+        application = await prisma.application.update({
+          where: { id: application.id },
+          data: { stage1Data: { ...stage1, address: signerAddress } },
+        });
+      }
+    }
     const returnUrl = buildReturnUrl(req, req.body?.returnBaseUrl);
     const forceNew = req.body?.forceNew === true;
     let recreateForMissingWitness = false;
@@ -385,6 +402,22 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
       }
     }
 
+    if (
+      !needsNewEnvelope &&
+      envelopeId &&
+      signerAddress &&
+      isDocusignConfigured() &&
+      application.docusignStatus !== "COMPLETED"
+    ) {
+      try {
+        if (await envelopeMissingSignupAddress(envelopeId, signerAddress)) {
+          needsNewEnvelope = true;
+        }
+      } catch {
+        // keep existing envelope
+      }
+    }
+
     if (needsNewEnvelope) {
       const attachPmiEvidence = req.body?.attachPmiEvidence !== false;
       let documents = [];
@@ -401,6 +434,7 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
       envelopeId = await createEnvelopeFromTemplate({
         signerEmail: user.email,
         signerName,
+        signerAddress,
         clientUserId: user.id,
         documents,
       });
@@ -434,6 +468,7 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
       envelopeId,
       signerEmail: user.email,
       signerName,
+      signerAddress,
       clientUserId: user.id,
       returnUrl,
     });
@@ -501,8 +536,8 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
     const witnessAddress = String(req.body?.witnessAddress || "").trim();
     const homeReturnUrl = buildWitnessHomeReturnUrl(req, req.body?.returnBaseUrl);
 
-    if (!witnessEmail || !witnessName) {
-      return res.status(400).json({ error: "Witness name and email are required." });
+    if (!witnessEmail || !witnessName || !witnessAddress) {
+      return res.status(400).json({ error: "Witness name, email and address are required." });
     }
 
     if (!application.docusignEnvelopeId) {
@@ -546,6 +581,7 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
     await assignWitnessRecipient(application.docusignEnvelopeId, {
       email: witnessEmail,
       name: witnessName,
+      address: witnessAddress,
       clientUserId: witnessClientUserId,
     });
 
@@ -582,6 +618,7 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
       envelopeId: application.docusignEnvelopeId,
       witnessEmail,
       witnessName,
+      witnessAddress,
       witnessClientUserId,
       returnUrl: homeReturnUrl,
     });

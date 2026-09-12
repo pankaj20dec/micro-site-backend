@@ -157,8 +157,32 @@ applicationRouter.patch("/step", async (req, res) => {
     if (pmiInsurerName !== undefined) data.pmiInsurerName = pmiInsurerName;
     if (pmiPolicyStartDate !== undefined) data.pmiPolicyStartDate = new Date(pmiPolicyStartDate);
     if (pmiPolicyEndDate !== undefined) data.pmiPolicyEndDate = new Date(pmiPolicyEndDate);
-    if (stage1Data !== undefined) data.stage1Data = stage1Data;
-    if (stage2Data !== undefined) data.stage2Data = stage2Data;
+    if (stage1Data !== undefined) {
+      const existing =
+        application.stage1Data &&
+        typeof application.stage1Data === "object" &&
+        !Array.isArray(application.stage1Data)
+          ? application.stage1Data
+          : {};
+      const incoming =
+        stage1Data && typeof stage1Data === "object" && !Array.isArray(stage1Data)
+          ? stage1Data
+          : {};
+      data.stage1Data = { ...existing, ...incoming };
+    }
+    if (stage2Data !== undefined) {
+      const existing =
+        application.stage2Data &&
+        typeof application.stage2Data === "object" &&
+        !Array.isArray(application.stage2Data)
+          ? application.stage2Data
+          : {};
+      const incoming =
+        stage2Data && typeof stage2Data === "object" && !Array.isArray(stage2Data)
+          ? stage2Data
+          : {};
+      data.stage2Data = { ...existing, ...incoming };
+    }
     if (riskAccepted === true) data.riskAcceptedAt = new Date();
 
     let normalizedStatus;

@@ -33,6 +33,7 @@ paymentRouter.post("/stripe/create-intent", requireAuth, async (req, res) => {
       if (confirmStub) {
         stubData.paymentStatus = "PAID";
         stubData.stripePaymentIntentId = `stub_pi_${Date.now()}`;
+        stubData.paidAt = new Date();
       }
       await prisma.application.update({
         where: { id: application.id },
@@ -101,6 +102,7 @@ paymentRouter.post("/stripe/confirm", requireAuth, async (req, res) => {
         data: {
           paymentStatus: "PAID",
           stripePaymentIntentId: intentId,
+          paidAt: new Date(),
         },
       });
       return res.json({ stub: true, paid: true, status: "PAID" });
@@ -127,6 +129,7 @@ paymentRouter.post("/stripe/confirm", requireAuth, async (req, res) => {
         data: {
           paymentStatus: "PAID",
           stripePaymentIntentId: paymentIntent.id,
+          paidAt: new Date(),
         },
       }),
       prisma.paymentEvent.create({
@@ -177,7 +180,7 @@ paymentRouter.post(
       await prisma.$transaction([
         prisma.application.update({
           where: { id: applicationId },
-          data: { paymentStatus: "PAID" },
+          data: { paymentStatus: "PAID", paidAt: new Date() },
         }),
         prisma.paymentEvent.create({
           data: {
@@ -354,6 +357,7 @@ paymentRouter.post("/paypal/capture-order", requireAuth, async (req, res) => {
         data: {
           paymentStatus: "PAID",
           paypalCaptureId: `stub_capture_${Date.now()}`,
+          paidAt: new Date(),
         },
       });
       return res.json({ stub: true, status: "COMPLETED" });
@@ -403,7 +407,7 @@ paymentRouter.post("/paypal/capture-order", requireAuth, async (req, res) => {
 
     await prisma.application.update({
       where: { id: application.id },
-      data: { paymentStatus: "PAID", paypalCaptureId: captureId },
+      data: { paymentStatus: "PAID", paypalCaptureId: captureId, paidAt: new Date() },
     });
 
     if (captureId) {
