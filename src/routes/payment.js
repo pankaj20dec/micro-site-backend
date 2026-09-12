@@ -5,6 +5,56 @@ import { resolveAppBaseUrl, registerPayPalReturnPath } from "../lib/appBaseUrl.j
 
 export const paymentRouter = Router();
 
+function prismaErrorCode(err) {
+  return String(err?.code || err?.meta?.code || "");
+}
+
+function isUniqueConstraintError(err) {
+  return prismaErrorCode(err) === "P2002";
+}
+
+function isMissingColumnError(err, column) {
+  const message = String(err?.message || err?.meta?.column || "");
+  return prismaErrorCode(err) === "P2022" || message.includes(column);
+}
+
+async function markApplicationPaid(applicationId, extra = {}) {
+  const data = {
+    paymentStatus: "PAID",
+    paidAt: new Date(),
+    ...extra,
+  };
+  try {
+    return await prisma.application.update({
+      where: { id: applicationId },
+      data,
+    });
+  } catch (err) {
+    if (!isMissingColumnError(err, "paidAt")) throw err;
+    delete data.paidAt;
+    return prisma.application.update({
+      where: { id: applicationId },
+      data,
+    });
+  }
+}
+
+async function recordPaymentEvent(data) {
+  try {
+    await prisma.paymentEvent.upsert({
+      where: { providerEventId: data.providerEventId },
+      create: data,
+      update: {
+        status: data.status,
+        type: data.type,
+      },
+    });
+  } catch (err) {
+    if (isUniqueConstraintError(err)) return;
+    console.warn("Payment event save failed:", err?.message || err);
+  }
+}
+
 // ─── Stripe ──────────────────────────────────────────────────────────────────
 
 // POST /api/payment/stripe/create-intent
@@ -97,13 +147,8 @@ paymentRouter.post("/stripe/confirm", requireAuth, async (req, res) => {
     }
 
     if (!process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY === "sk_test_placeholder") {
-      await prisma.application.update({
-        where: { id: application.id },
-        data: {
-          paymentStatus: "PAID",
-          stripePaymentIntentId: intentId,
-          paidAt: new Date(),
-        },
+      await markApplicationPaid(application.id, {
+        stripePaymentIntentId: intentId,
       });
       return res.json({ stub: true, paid: true, status: "PAID" });
     }
@@ -112,7 +157,11 @@ paymentRouter.post("/stripe/confirm", requireAuth, async (req, res) => {
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
     const paymentIntent = await stripe.paymentIntents.retrieve(intentId);
 
-    if (paymentIntent.metadata?.applicationId !== application.id) {
+    const metadataAppId = paymentIntent.metadata?.applicationId;
+    const belongsToApplication =
+      metadataAppId === application.id ||
+      application.stripePaymentIntentId === paymentIntent.id;
+    if (!belongsToApplication) {
       return res.status(403).json({ error: "Payment does not belong to this application" });
     }
 
@@ -123,32 +172,34 @@ paymentRouter.post("/stripe/confirm", requireAuth, async (req, res) => {
       });
     }
 
-    await prisma.$transaction([
-      prisma.application.update({
-        where: { id: application.id },
-        data: {
-          paymentStatus: "PAID",
-          stripePaymentIntentId: paymentIntent.id,
-          paidAt: new Date(),
-        },
-      }),
-      prisma.paymentEvent.create({
-        data: {
-          applicationId: application.id,
-          provider: "STRIPE",
-          providerEventId: paymentIntent.id,
-          type: "payment_intent.confirm",
-          amount: paymentIntent.amount / 100,
-          currency: paymentIntent.currency,
-          status: paymentIntent.status,
-        },
-      }),
-    ]);
+    await markApplicationPaid(application.id, {
+      stripePaymentIntentId: paymentIntent.id,
+    });
+    await recordPaymentEvent({
+      applicationId: application.id,
+      provider: "STRIPE",
+      providerEventId: paymentIntent.id,
+      type: "payment_intent.confirm",
+      amount: paymentIntent.amount / 100,
+      currency: paymentIntent.currency,
+      status: paymentIntent.status,
+    });
 
     return res.json({ paid: true, status: "PAID" });
   } catch (err) {
     console.error("Stripe confirm error:", err);
-    return res.status(500).json({ error: "Failed to confirm Stripe payment" });
+    const stripeMessage = err?.raw?.message || err?.message;
+    if (err?.type === "StripeInvalidRequestError" || err?.statusCode === 404) {
+      return res.status(400).json({
+        error: stripeMessage || "Stripe payment could not be found. Try the card payment again.",
+      });
+    }
+    if (isUniqueConstraintError(err)) {
+      return res.json({ paid: true, status: "PAID" });
+    }
+    return res.status(500).json({
+      error: stripeMessage || "Failed to confirm Stripe payment",
+    });
   }
 });
 
@@ -176,24 +227,20 @@ paymentRouter.post(
     if (event.type === "payment_intent.succeeded") {
       const pi = event.data.object;
       const { applicationId } = pi.metadata;
-
-      await prisma.$transaction([
-        prisma.application.update({
-          where: { id: applicationId },
-          data: { paymentStatus: "PAID", paidAt: new Date() },
-        }),
-        prisma.paymentEvent.create({
-          data: {
-            applicationId,
-            provider: "STRIPE",
-            providerEventId: event.id,
-            type: event.type,
-            amount: pi.amount / 100,
-            currency: pi.currency,
-            status: "succeeded",
-          },
-        }),
-      ]);
+      if (applicationId) {
+        await markApplicationPaid(applicationId, {
+          stripePaymentIntentId: pi.id,
+        });
+        await recordPaymentEvent({
+          applicationId,
+          provider: "STRIPE",
+          providerEventId: event.id,
+          type: event.type,
+          amount: pi.amount / 100,
+          currency: pi.currency,
+          status: "succeeded",
+        });
+      }
     }
 
     if (event.type === "payment_intent.payment_failed") {
