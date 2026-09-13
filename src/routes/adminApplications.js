@@ -301,6 +301,51 @@ async function resolvePayPalCaptureId(application, token, base) {
   return order.purchase_units?.[0]?.payments?.captures?.[0]?.id || null;
 }
 
+async function fetchPayPalCapture(token, base, captureId) {
+  const captureRes = await fetch(`${base}/v2/payments/captures/${captureId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return captureRes.json();
+}
+
+function isPayPalRequestIdReuseError(refund, issue) {
+  const message = String(
+    refund?.details?.[0]?.description || refund?.message || ""
+  ).toLowerCase();
+  const code = String(issue || refund?.name || "").toUpperCase();
+  return (
+    code.includes("IDEMPOTENT") ||
+    message.includes("paypal-request-id") ||
+    message.includes("already been used")
+  );
+}
+
+function isPayPalAlreadyRefunded(issue, capture) {
+  const code = String(issue || "").toUpperCase();
+  const status = String(capture?.status || "").toUpperCase();
+  return (
+    code.includes("CAPTURE_FULLY_REFUNDED") ||
+    code.includes("CAPTURE_ALREADY_REFUNDED") ||
+    status === "REFUNDED" ||
+    status === "PARTIALLY_REFUNDED"
+  );
+}
+
+async function postPayPalRefund(token, base, captureId, requestId) {
+  const refundRes = await fetch(`${base}/v2/payments/captures/${captureId}/refund`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+      ...(requestId ? { "PayPal-Request-Id": requestId } : {}),
+    },
+    body: "{}",
+  });
+  const refund = await refundRes.json();
+  return { refundRes, refund };
+}
+
 async function refundPayPalCapture(application) {
   if (isPayPalStubApplication(application)) {
     return {
@@ -328,20 +373,34 @@ async function refundPayPalCapture(application) {
     throw err;
   }
 
-  const refundRes = await fetch(`${auth.base}/v2/payments/captures/${captureId}/refund`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${auth.token}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-      "PayPal-Request-Id": `refund-${application.id}`,
-    },
-    body: "{}",
-  });
-  const refund = await refundRes.json();
-  const issue = refund.details?.[0]?.issue;
+  let { refundRes, refund } = await postPayPalRefund(
+    auth.token,
+    auth.base,
+    captureId,
+    `refund-${captureId}`
+  );
+  let issue = refund.details?.[0]?.issue || refund.name;
 
-  if (issue === "CAPTURE_FULLY_REFUNDED" || issue === "CAPTURE_ALREADY_REFUNDED") {
+  if (isPayPalRequestIdReuseError(refund, issue)) {
+    const capture = await fetchPayPalCapture(auth.token, auth.base, captureId);
+    if (isPayPalAlreadyRefunded(issue, capture)) {
+      return {
+        stub: false,
+        providerEventId: refund.id || `paypal_already_refunded_${captureId}`,
+        refundStatus: "COMPLETED",
+        captureId,
+      };
+    }
+    ({ refundRes, refund } = await postPayPalRefund(
+      auth.token,
+      auth.base,
+      captureId,
+      `refund-${captureId}-${Date.now()}`
+    ));
+    issue = refund.details?.[0]?.issue || refund.name;
+  }
+
+  if (isPayPalAlreadyRefunded(issue, refund)) {
     return {
       stub: false,
       providerEventId: refund.id || `paypal_already_refunded_${captureId}`,

@@ -22,6 +22,7 @@ async function markApplicationPaid(applicationId, extra = {}) {
   const data = {
     paymentStatus: "PAID",
     paidAt: new Date(),
+    refundedAt: null,
     ...extra,
   };
   try {
@@ -30,6 +31,22 @@ async function markApplicationPaid(applicationId, extra = {}) {
       data,
     });
   } catch (err) {
+    if (isMissingColumnError(err, "refundedAt")) {
+      delete data.refundedAt;
+      try {
+        return await prisma.application.update({
+          where: { id: applicationId },
+          data,
+        });
+      } catch (retryErr) {
+        if (!isMissingColumnError(retryErr, "paidAt")) throw retryErr;
+        delete data.paidAt;
+        return prisma.application.update({
+          where: { id: applicationId },
+          data,
+        });
+      }
+    }
     if (!isMissingColumnError(err, "paidAt")) throw err;
     delete data.paidAt;
     return prisma.application.update({
@@ -338,12 +355,31 @@ function isAlreadyCapturedIssue(issue) {
   );
 }
 
+function paypalCaptureAmount(order) {
+  const capture = paypalCaptureFromOrder(order);
+  const value =
+    capture?.amount?.value ||
+    order?.purchase_units?.[0]?.amount?.value ||
+    null;
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function membershipFromFee(fee) {
+  if (Number(fee) === 500) return { membershipFee: 500, membershipType: "ORGANISATION" };
+  if (Number(fee) === 250) return { membershipFee: 250, membershipType: "INDIVIDUAL" };
+  return {};
+}
+
 async function markPayPalOrderPaid(application, order, orderId) {
   const capture = paypalCaptureFromOrder(order);
   const captureId = capture?.id || application.paypalCaptureId || null;
+  const amount = paypalCaptureAmount(order) ?? Number(application.membershipFee ?? 0);
   await markApplicationPaid(application.id, {
     paymentProvider: "PAYPAL",
     paypalOrderId: order?.id || orderId || application.paypalOrderId,
+    refundedAt: null,
+    ...membershipFromFee(amount),
     ...(captureId ? { paypalCaptureId: captureId } : {}),
   });
   if (captureId) {
@@ -352,8 +388,11 @@ async function markPayPalOrderPaid(application, order, orderId) {
       provider: "PAYPAL",
       providerEventId: captureId,
       type: "PAYMENT.CAPTURE.COMPLETED",
-      amount: application.membershipFee ?? 0,
-      currency: process.env.PAYPAL_CURRENCY || "GBP",
+      amount: amount || 0,
+      currency:
+        capture?.amount?.currency_code ||
+        process.env.PAYPAL_CURRENCY ||
+        "GBP",
       status: capture?.status || "COMPLETED",
     });
   }
@@ -494,7 +533,11 @@ paymentRouter.post("/paypal/capture-order", requireAuth, async (req, res) => {
 
     if (!application) return res.status(404).json({ error: "Order not found" });
 
-    if (application.paymentStatus === "PAID") {
+    if (
+      application.paymentStatus === "PAID" &&
+      (application.paypalOrderId === orderId ||
+        (!application.paypalOrderId && !application.paypalCaptureId))
+    ) {
       return res.json({ status: "COMPLETED", alreadyPaid: true });
     }
 
