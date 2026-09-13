@@ -6,6 +6,7 @@ import { prisma } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { sendApplicationSubmittedEmail, sendSupporterMemberEmail, sendSaveResumeEmail } from "../lib/mailer.js";
 import { resolveAppBaseUrl } from "../lib/appBaseUrl.js";
+import { getEnvelopeCombinedPdf } from "../lib/docusignClient.js";
 import {
   createEvidenceUploadTarget,
   deleteEvidenceFile,
@@ -227,10 +228,22 @@ applicationRouter.patch("/step", async (req, res) => {
       prisma.user
         .findUnique({
           where: { id: req.user.sub },
-          select: { firstName: true, email: true },
+          select: { firstName: true, lastName: true, email: true },
         })
-        .then((user) => {
-          if (user) return sendApplicationSubmittedEmail(user, updated);
+        .then(async (user) => {
+          if (!user) return;
+          let signedDocumentsPdf = null;
+          if (updated.applicationType === "CLAIMANT" && updated.docusignEnvelopeId) {
+            try {
+              signedDocumentsPdf = await getEnvelopeCombinedPdf(updated.docusignEnvelopeId);
+            } catch (err) {
+              console.error(
+                "Could not attach signed legal documents to welcome email:",
+                err?.message || err
+              );
+            }
+          }
+          return sendApplicationSubmittedEmail(user, updated, { signedDocumentsPdf });
         })
         .catch((err) =>
           console.error("Submitted email failed:", err?.message || err)
