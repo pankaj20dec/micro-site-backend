@@ -22,6 +22,7 @@ import {
   envelopeMissingSignupAddress,
 } from "../lib/docusignClient.js";
 import { syncDocusignStatusFromApi, getApplicationDocusignSnapshot } from "../lib/docusignSync.js";
+import { maybeSendFullySignedDocumentsEmail } from "../lib/signedDocumentsEmail.js";
 import {
   getDocusignSignatures,
   mapConnectEventToStatus,
@@ -765,6 +766,19 @@ docusignRouter.post("/webhook", async (req, res) => {
       payload?.data?.envelopeSummary?.statusDateTime ||
       null;
     updateData.legalSignedAt = completedDateTime ? new Date(completedDateTime) : new Date();
+    const stage2 =
+      application.stage2Data && typeof application.stage2Data === "object"
+        ? application.stage2Data
+        : {};
+    const witness =
+      stage2.witness && typeof stage2.witness === "object" ? stage2.witness : {};
+    updateData.stage2Data = {
+      ...stage2,
+      witness: {
+        ...witness,
+        declarationSigned: true,
+      },
+    };
   } else if (application.docusignStatus === "COMPLETED") {
     updateData.legalSignedAt = null;
   }
@@ -773,33 +787,10 @@ docusignRouter.post("/webhook", async (req, res) => {
 
   if (status === "COMPLETED") {
     try {
-      const remote = await getEnvelopeStatus(envelopeId, { forceRefresh: true });
-      const signers = remote.signers || [];
-      const allDone =
-        signers.length >= 2 &&
-        signers.every((signer) =>
-          ["completed", "signed", "autoresponded"].includes(
-            String(signer.status || "").toLowerCase()
-          )
-        );
-      if (allDone || remote.allSignersCompleted) {
-        const stage2 =
-          application.stage2Data && typeof application.stage2Data === "object"
-            ? application.stage2Data
-            : {};
-        const witness =
-          stage2.witness && typeof stage2.witness === "object" ? stage2.witness : {};
-        updateData.stage2Data = {
-          ...stage2,
-          witness: {
-            ...witness,
-            declarationSigned: true,
-          },
-        };
-      }
+      await getEnvelopeStatus(envelopeId, { forceRefresh: true });
     } catch (err) {
       console.warn(
-        "DocuSign webhook: could not sync witness completion flags:",
+        "DocuSign webhook: could not refresh envelope after completion:",
         err.message
       );
     }
@@ -809,6 +800,16 @@ docusignRouter.post("/webhook", async (req, res) => {
     where: { id: application.id },
     data: updateData,
   });
+
+  if (status === "COMPLETED") {
+    const nextApplication = {
+      ...application,
+      ...updateData,
+    };
+    maybeSendFullySignedDocumentsEmail(nextApplication).catch((err) =>
+      console.error("Fully signed documents email failed:", err?.message || err)
+    );
+  }
 
   console.log(`DocuSign webhook: application ${application.id} → ${status}`);
   return res.status(200).json({ received: true, applicationId: application.id, status });

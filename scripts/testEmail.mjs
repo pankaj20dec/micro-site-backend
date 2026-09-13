@@ -9,9 +9,9 @@ if (!to) {
 
 const result = await sendMail({
   to,
-  subject: "FIPO SMTP test",
-  text: "If you received this, Mailjet SMTP is working.",
-  html: "<p>If you received this, <strong>Mailjet SMTP</strong> is working.</p>",
+  subject: "FIPO Zoho SMTP test",
+  text: "If you received this, Zoho SMTP is working.",
+  html: "<p>If you received this, <strong>Zoho SMTP</strong> is working.</p>",
 });
 
 if (result.ok) {
