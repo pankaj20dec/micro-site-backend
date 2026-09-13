@@ -112,13 +112,14 @@ adminApplicationsRouter.get("/", requireAdmin, async (req, res) => {
   }
 });
 
-const REFUND_WINDOW_DAYS = 15;
+const REFUND_WINDOW_DAYS = 14;
 
 function resolvePaidAt(application) {
   if (application.paidAt) return new Date(application.paidAt);
   const paidEvent = (application.paymentEvents || []).find(
     (event) =>
       event.status === "succeeded" ||
+      event.status === "COMPLETED" ||
       event.type === "payment_intent.confirm" ||
       event.type === "payment_intent.succeeded" ||
       event.type === "PAYMENT.CAPTURE.COMPLETED"
@@ -131,14 +132,149 @@ function refundDeadline(paidAt) {
   return new Date(paidAt.getTime() + REFUND_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 }
 
+function paypalApiBase() {
+  return process.env.PAYPAL_MODE === "live"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
+}
+
+function isPayPalStubApplication(application) {
+  const captureId = String(application.paypalCaptureId || "");
+  const orderId = String(application.paypalOrderId || "");
+  return (
+    !process.env.PAYPAL_CLIENT_ID ||
+    process.env.PAYPAL_CLIENT_ID === "placeholder" ||
+    captureId.startsWith("stub_capture_") ||
+    orderId.startsWith("stub_order_")
+  );
+}
+
+async function getPayPalAccessToken() {
+  const clientId = process.env.PAYPAL_CLIENT_ID?.trim();
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret || clientId === "placeholder") return null;
+
+  const base = paypalApiBase();
+  const tokenRes = await fetch(`${base}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || !tokenData.access_token) {
+    const err = new Error(
+      tokenData.error_description || tokenData.error || "PayPal authentication failed"
+    );
+    err.code = "PAYPAL_AUTH";
+    throw err;
+  }
+  return { token: tokenData.access_token, base };
+}
+
+async function resolvePayPalCaptureId(application, token, base) {
+  if (application.paypalCaptureId) return application.paypalCaptureId;
+  if (!application.paypalOrderId) return null;
+
+  const orderRes = await fetch(`${base}/v2/checkout/orders/${application.paypalOrderId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const order = await orderRes.json();
+  if (!orderRes.ok) {
+    const detail = order.details?.[0]?.description || order.message || "Could not load PayPal order";
+    const err = new Error(detail);
+    err.code = "PAYPAL_ORDER";
+    throw err;
+  }
+  return order.purchase_units?.[0]?.payments?.captures?.[0]?.id || null;
+}
+
+async function refundPayPalCapture(application) {
+  if (isPayPalStubApplication(application)) {
+    return {
+      stub: true,
+      providerEventId: `local_refund_${application.id}_${Date.now()}`,
+      refundStatus: "succeeded",
+      captureId: application.paypalCaptureId,
+    };
+  }
+
+  const auth = await getPayPalAccessToken();
+  if (!auth) {
+    return {
+      stub: true,
+      providerEventId: `local_refund_${application.id}_${Date.now()}`,
+      refundStatus: "succeeded",
+      captureId: application.paypalCaptureId,
+    };
+  }
+
+  const captureId = await resolvePayPalCaptureId(application, auth.token, auth.base);
+  if (!captureId) {
+    const err = new Error("PayPal capture id is missing; this payment cannot be refunded.");
+    err.code = "PAYPAL_CAPTURE_MISSING";
+    throw err;
+  }
+
+  const refundRes = await fetch(`${auth.base}/v2/payments/captures/${captureId}/refund`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${auth.token}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+      "PayPal-Request-Id": `refund-${application.id}`,
+    },
+    body: "{}",
+  });
+  const refund = await refundRes.json();
+  const issue = refund.details?.[0]?.issue;
+
+  if (issue === "CAPTURE_FULLY_REFUNDED" || issue === "CAPTURE_ALREADY_REFUNDED") {
+    return {
+      stub: false,
+      providerEventId: refund.id || `paypal_already_refunded_${captureId}`,
+      refundStatus: "COMPLETED",
+      captureId,
+    };
+  }
+
+  if (!refundRes.ok || !refund.id) {
+    const detail =
+      refund.details?.[0]?.description || refund.message || "PayPal refund failed";
+    const err = new Error(detail);
+    err.code = issue || "PAYPAL_REFUND";
+    throw err;
+  }
+
+  return {
+    stub: false,
+    providerEventId: refund.id,
+    refundStatus: refund.status || "COMPLETED",
+    captureId,
+  };
+}
+
 // GET /api/admin/applications/refundable — must be before /:id
 adminApplicationsRouter.get("/refundable", requireSuperAdmin, async (_req, res) => {
   try {
     const applications = await prisma.application.findMany({
       where: {
         paymentStatus: "PAID",
-        paymentProvider: "STRIPE",
-        stripePaymentIntentId: { not: null },
+        OR: [
+          {
+            paymentProvider: "STRIPE",
+            stripePaymentIntentId: { not: null },
+          },
+          {
+            paymentProvider: "PAYPAL",
+            OR: [
+              { paypalCaptureId: { not: null } },
+              { paypalOrderId: { not: null } },
+            ],
+          },
+        ],
       },
       include: {
         user: {
@@ -273,7 +409,7 @@ adminApplicationsRouter.delete("/:id", requireSuperAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/applications/:id/refund — Stripe refund (super admin, within 15 days)
+// POST /api/admin/applications/:id/refund — Stripe or PayPal refund (super admin, within 14 days)
 adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) => {
   try {
     const application = await prisma.application.findUnique({
@@ -293,8 +429,13 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
       return res.status(400).json({ error: "Only paid applications can be refunded" });
     }
 
-    if (application.paymentProvider !== "STRIPE" || !application.stripePaymentIntentId) {
-      return res.status(400).json({ error: "Only Stripe payments can be refunded here" });
+    const provider = String(application.paymentProvider || "").toUpperCase();
+    const isStripe = provider === "STRIPE" && !!application.stripePaymentIntentId;
+    const isPayPal =
+      provider === "PAYPAL" && !!(application.paypalCaptureId || application.paypalOrderId);
+
+    if (!isStripe && !isPayPal) {
+      return res.status(400).json({ error: "Only Stripe and PayPal payments can be refunded here" });
     }
 
     const paidAt = resolvePaidAt(application);
@@ -314,32 +455,40 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
     }
 
     const amount = Number(application.membershipFee ?? 0);
-    const currency = "gbp";
     let providerEventId = `local_refund_${application.id}_${Date.now()}`;
     let refundStatus = "succeeded";
     let stub = false;
+    let paypalCaptureId = application.paypalCaptureId;
 
-    const stripeKey = process.env.STRIPE_SECRET_KEY;
-    const isStub =
-      !stripeKey ||
-      stripeKey === "sk_test_placeholder" ||
-      String(application.stripePaymentIntentId).startsWith("stub_pi_");
+    if (isStripe) {
+      const stripeKey = process.env.STRIPE_SECRET_KEY;
+      const isStub =
+        !stripeKey ||
+        stripeKey === "sk_test_placeholder" ||
+        String(application.stripePaymentIntentId).startsWith("stub_pi_");
 
-    if (isStub) {
-      stub = true;
+      if (isStub) {
+        stub = true;
+      } else {
+        const Stripe = (await import("stripe")).default;
+        const stripe = new Stripe(stripeKey);
+        const refund = await stripe.refunds.create({
+          payment_intent: application.stripePaymentIntentId,
+          reason: "requested_by_customer",
+          metadata: {
+            applicationId: application.id,
+            refundedBy: req.user.sub,
+          },
+        });
+        providerEventId = refund.id;
+        refundStatus = refund.status || "succeeded";
+      }
     } else {
-      const Stripe = (await import("stripe")).default;
-      const stripe = new Stripe(stripeKey);
-      const refund = await stripe.refunds.create({
-        payment_intent: application.stripePaymentIntentId,
-        reason: "requested_by_customer",
-        metadata: {
-          applicationId: application.id,
-          refundedBy: req.user.sub,
-        },
-      });
-      providerEventId = refund.id;
-      refundStatus = refund.status || "succeeded";
+      const paypalRefund = await refundPayPalCapture(application);
+      stub = paypalRefund.stub;
+      providerEventId = paypalRefund.providerEventId;
+      refundStatus = paypalRefund.refundStatus;
+      paypalCaptureId = paypalRefund.captureId || paypalCaptureId;
     }
 
     const [updated] = await prisma.$transaction([
@@ -349,6 +498,7 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
           paymentStatus: "REFUNDED",
           refundedAt: new Date(),
           paidAt: application.paidAt ?? paidAt,
+          ...(paypalCaptureId ? { paypalCaptureId } : {}),
         },
         include: {
           paymentEvents: { orderBy: { createdAt: "desc" } },
@@ -362,16 +512,18 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
           },
         },
       }),
-      prisma.paymentEvent.create({
-        data: {
+      prisma.paymentEvent.upsert({
+        where: { providerEventId },
+        create: {
           applicationId: application.id,
-          provider: "STRIPE",
+          provider,
           providerEventId,
           type: "refund",
           amount,
-          currency,
+          currency: isPayPal ? process.env.PAYPAL_CURRENCY || "GBP" : "gbp",
           status: refundStatus,
         },
+        update: { status: refundStatus },
       }),
       prisma.auditLog.create({
         data: {
@@ -380,8 +532,10 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
           targetId: application.id,
           targetType: "Application",
           metadata: {
-            provider: "STRIPE",
+            provider,
             stripePaymentIntentId: application.stripePaymentIntentId,
+            paypalOrderId: application.paypalOrderId,
+            paypalCaptureId,
             providerEventId,
             amount,
             stub,
@@ -396,13 +550,20 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
       stub,
       message: stub
         ? "Dev mode: payment marked as refunded locally."
-        : "Stripe refund created successfully.",
+        : `${isPayPal ? "PayPal" : "Stripe"} refund created successfully.`,
     });
   } catch (err) {
     console.error("Refund error:", err);
     const message =
       err?.raw?.message || err?.message || "Failed to refund payment";
-    return res.status(500).json({ error: message });
+    const status =
+      err?.code === "PAYPAL_CAPTURE_MISSING" ||
+      err?.code === "PAYPAL_AUTH" ||
+      err?.code === "PAYPAL_ORDER" ||
+      err?.statusCode === 400
+        ? 400
+        : 500;
+    return res.status(status).json({ error: message });
   }
 });
 
