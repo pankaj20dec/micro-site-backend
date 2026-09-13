@@ -132,6 +132,116 @@ function refundDeadline(paidAt) {
   return new Date(paidAt.getTime() + REFUND_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 }
 
+function isRefundedEnumError(err) {
+  const message = String(err?.message || "");
+  return (
+    message.includes("Expected PaymentStatus") ||
+    message.includes('invalid input value for enum "PaymentStatus"') ||
+    message.includes("Value 'REFUNDED' not found in enum")
+  );
+}
+
+async function ensureRefundedEnumAndColumns() {
+  try {
+    await prisma.$executeRawUnsafe(
+      `ALTER TYPE "PaymentStatus" ADD VALUE IF NOT EXISTS 'REFUNDED'`
+    );
+  } catch (err) {
+    console.warn("Could not add PaymentStatus.REFUNDED:", err?.message || err);
+  }
+  try {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "Application" ADD COLUMN IF NOT EXISTS "paidAt" TIMESTAMP(3)`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "Application" ADD COLUMN IF NOT EXISTS "refundedAt" TIMESTAMP(3)`
+    );
+  } catch (err) {
+    console.warn("Could not add refund timestamp columns:", err?.message || err);
+  }
+}
+
+const refundedInclude = {
+  paymentEvents: { orderBy: { createdAt: "desc" } },
+  user: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+    },
+  },
+};
+
+async function loadRefundedApplication(id) {
+  try {
+    return await prisma.application.findUnique({
+      where: { id },
+      include: refundedInclude,
+    });
+  } catch (err) {
+    console.warn("Could not reload refunded application:", err?.message || err);
+    return null;
+  }
+}
+
+async function markApplicationRefunded(application, { paidAt, paypalCaptureId }) {
+  const refundedAt = new Date();
+  const paidAtValue = application.paidAt ?? paidAt;
+  const data = {
+    paymentStatus: "REFUNDED",
+    refundedAt,
+    paidAt: paidAtValue,
+    ...(paypalCaptureId ? { paypalCaptureId } : {}),
+  };
+
+  try {
+    return await prisma.application.update({
+      where: { id: application.id },
+      data,
+      include: refundedInclude,
+    });
+  } catch (err) {
+    const message = String(err?.message || "");
+    const canFallback =
+      isRefundedEnumError(err) ||
+      message.includes("refundedAt") ||
+      message.includes("paidAt");
+    if (!canFallback) throw err;
+
+    console.warn("Prisma refund update failed, using SQL fallback:", message);
+    await ensureRefundedEnumAndColumns();
+
+    if (paypalCaptureId) {
+      await prisma.$executeRaw`
+        UPDATE "Application"
+        SET "paymentStatus" = CAST('REFUNDED' AS "PaymentStatus"),
+            "refundedAt" = ${refundedAt},
+            "paidAt" = COALESCE("paidAt", ${paidAtValue}),
+            "paypalCaptureId" = ${paypalCaptureId}
+        WHERE "id" = ${application.id}
+      `;
+    } else {
+      await prisma.$executeRaw`
+        UPDATE "Application"
+        SET "paymentStatus" = CAST('REFUNDED' AS "PaymentStatus"),
+            "refundedAt" = ${refundedAt},
+            "paidAt" = COALESCE("paidAt", ${paidAtValue})
+        WHERE "id" = ${application.id}
+      `;
+    }
+
+    const updated = await loadRefundedApplication(application.id);
+    return (
+      updated || {
+        ...application,
+        ...data,
+        paymentEvents: application.paymentEvents || [],
+      }
+    );
+  }
+}
+
 function paypalApiBase() {
   return process.env.PAYPAL_MODE === "live"
     ? "https://api-m.paypal.com"
@@ -454,6 +564,8 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
       });
     }
 
+    await ensureRefundedEnumAndColumns();
+
     const amount = Number(application.membershipFee ?? 0);
     let providerEventId = `local_refund_${application.id}_${Date.now()}`;
     let refundStatus = "succeeded";
@@ -491,28 +603,13 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
       paypalCaptureId = paypalRefund.captureId || paypalCaptureId;
     }
 
-    const [updated] = await prisma.$transaction([
-      prisma.application.update({
-        where: { id: application.id },
-        data: {
-          paymentStatus: "REFUNDED",
-          refundedAt: new Date(),
-          paidAt: application.paidAt ?? paidAt,
-          ...(paypalCaptureId ? { paypalCaptureId } : {}),
-        },
-        include: {
-          paymentEvents: { orderBy: { createdAt: "desc" } },
-          user: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              email: true,
-            },
-          },
-        },
-      }),
-      prisma.paymentEvent.upsert({
+    const updated = await markApplicationRefunded(application, {
+      paidAt,
+      paypalCaptureId,
+    });
+
+    try {
+      await prisma.paymentEvent.upsert({
         where: { providerEventId },
         create: {
           applicationId: application.id,
@@ -524,8 +621,13 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
           status: refundStatus,
         },
         update: { status: refundStatus },
-      }),
-      prisma.auditLog.create({
+      });
+    } catch (eventErr) {
+      console.warn("Refund payment event save failed:", eventErr?.message || eventErr);
+    }
+
+    try {
+      await prisma.auditLog.create({
         data: {
           actorId: req.user.sub,
           action: "PAYMENT_REFUND",
@@ -542,8 +644,10 @@ adminApplicationsRouter.post("/:id/refund", requireSuperAdmin, async (req, res) 
             paidAt: paidAt.toISOString(),
           },
         },
-      }),
-    ]);
+      });
+    } catch (auditErr) {
+      console.warn("Refund audit log save failed:", auditErr?.message || auditErr);
+    }
 
     return res.json({
       application: updated,
