@@ -1,4 +1,15 @@
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import nodemailer from "nodemailer";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CANCELLATION_FORM_PATH = join(
+  __dirname,
+  "../assets/emails/FIPO-Cancellation-Form.docx"
+);
+const CANCELLATION_FORM_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
 /**
  * Email transport:
@@ -12,10 +23,43 @@ let transportMode = "stub";
 
 const EMAIL_FROM = process.env.EMAIL_FROM || "FIPO <noreply@fipo.co.uk>";
 
+let cancellationFormAttachment;
+
 function parseFromAddress(from) {
   const match = from.match(/^(.+?)\s*<([^>]+)>$/);
   if (match) return { name: match[1].trim(), email: match[2].trim() };
   return { name: "", email: from.trim() };
+}
+
+function consultantName(user) {
+  const name = [user?.firstName, user?.lastName].filter(Boolean).join(" ").trim();
+  return name || "Consultant";
+}
+
+function formatUkDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function getCancellationFormAttachment() {
+  if (cancellationFormAttachment !== undefined) return cancellationFormAttachment;
+  try {
+    cancellationFormAttachment = {
+      filename: "FIPO-Cancellation-Form.docx",
+      content: readFileSync(CANCELLATION_FORM_PATH),
+      contentType: CANCELLATION_FORM_TYPE,
+    };
+  } catch (err) {
+    console.error("Cancellation form missing:", err.message);
+    cancellationFormAttachment = null;
+  }
+  return cancellationFormAttachment;
 }
 
 function resolveTransportMode() {
@@ -68,10 +112,23 @@ function getMailjetCredentials() {
   return { apiKey, secret };
 }
 
-async function sendViaMailjetApi({ to, subject, html, text }) {
+function toMailjetAttachments(attachments = []) {
+  return attachments
+    .filter((file) => file?.content && file?.filename)
+    .map((file) => ({
+      ContentType: file.contentType || "application/octet-stream",
+      Filename: file.filename,
+      Base64Content: Buffer.isBuffer(file.content)
+        ? file.content.toString("base64")
+        : Buffer.from(file.content).toString("base64"),
+    }));
+}
+
+async function sendViaMailjetApi({ to, subject, html, text, attachments = [] }) {
   const { apiKey, secret } = getMailjetCredentials();
   const { name, email } = parseFromAddress(EMAIL_FROM);
   const auth = Buffer.from(`${apiKey}:${secret}`).toString("base64");
+  const mailjetAttachments = toMailjetAttachments(attachments);
 
   const res = await fetch("https://api.mailjet.com/v3.1/send", {
     method: "POST",
@@ -87,6 +144,7 @@ async function sendViaMailjetApi({ to, subject, html, text }) {
           Subject: subject,
           TextPart: text,
           HTMLPart: html,
+          ...(mailjetAttachments.length ? { Attachments: mailjetAttachments } : {}),
         },
       ],
     }),
@@ -110,22 +168,39 @@ async function sendViaMailjetApi({ to, subject, html, text }) {
   return { ok: true, id: messageId ? String(messageId) : undefined };
 }
 
-export async function sendMail({ to, subject, html, text }) {
+export async function sendMail({ to, subject, html, text, attachments = [] }) {
   const mode = transportMode === "stub" ? resolveTransportMode() : transportMode;
   transportMode = mode;
+  const files = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
 
   try {
     if (mode === "mailjet-api") {
-      const result = await sendViaMailjetApi({ to, subject, html, text });
+      const result = await sendViaMailjetApi({ to, subject, html, text, attachments: files });
       console.log(`[EMAIL] Sent to ${to} | Subject: ${subject} | id=${result.id || "n/a"}`);
       return result;
     }
 
     const tx = getTransporter();
-    const info = await tx.sendMail({ from: EMAIL_FROM, to, subject, html, text });
+    const info = await tx.sendMail({
+      from: EMAIL_FROM,
+      to,
+      subject,
+      html,
+      text,
+      attachments: files.map((file) => ({
+        filename: file.filename,
+        content: file.content,
+        contentType: file.contentType,
+      })),
+    });
     if (usingStub) {
       console.log(`\n[EMAIL:STUB] To: ${to} | Subject: ${subject}`);
       console.log(`[EMAIL:STUB] Body:\n${text || html}\n`);
+      if (files.length) {
+        console.log(
+          `[EMAIL:STUB] Attachments: ${files.map((file) => file.filename).join(", ")}`
+        );
+      }
     } else {
       console.log(`[EMAIL] Sent to ${to} | Subject: ${subject} | id=${info.messageId || "n/a"}`);
     }
@@ -265,32 +340,152 @@ If you didn't request this, you can safely ignore this email.
 }
 
 /**
- * Confirmation email sent once an application is submitted for review.
+ * Welcome email sent after a consultant successfully registers onto the claim.
+ * Attaches the signed legal documents (PDF) and the cancellation form (Word).
  */
-export async function sendApplicationSubmittedEmail(user, application) {
+export async function sendClaimWelcomeEmail(user, application, options = {}) {
+  const name = consultantName(user);
+  const safeName = escapeHtml(name);
+  const signedDate =
+    formatUkDate(application?.legalSignedAt) || formatUkDate(new Date());
+  const cancelExample = `I hereby give you notice that I wish to cancel my involvement in the proposed proceedings, which I entered into on ${signedDate}.`;
+
+  const p =
+    'style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;"';
+  const h =
+    'style="font-size:14px;line-height:1.6;color:#263238;font-weight:bold;margin:24px 0 8px;"';
+
+  const html = baseTemplate(
+    "Welcome",
+    `
+      <p ${p}>Dear ${safeName},</p>
+      <p ${p}>
+        Many thanks for taking the time to join our proposed legal proceedings.
+        We look forward to working with you on this over the coming months.
+      </p>
+      <p ${p}>
+        To that end, we attach the formal legal documents which you have signed,
+        so that you can keep them for your own records.
+      </p>
+      <p ${h}>Your right to cancel</p>
+      <p ${p}>
+        You have a 14-calendar-day period from the date you signed the documents
+        in which you may cancel your involvement in these proceedings, with
+        immediate effect and without giving any reason, at no cost to you.
+        To cancel, simply email
+        <a href="mailto:FIPO@harcusparker.co.uk" style="color:#802B7D;">FIPO@harcusparker.co.uk</a>,
+        stating, for example: &ldquo;${escapeHtml(cancelExample)}&rdquo;
+        A cancellation form is also attached for your convenience, should you
+        prefer to use it.
+      </p>
+      <p ${h}>Who we are</p>
+      <p ${p}>
+        Harcus Parker Limited is the firm of solicitors advising on these legal
+        proceedings. Its registered address is 80 Strand, London WC2R 0DT,
+        Tel: <a href="tel:+442033988300" style="color:#802B7D;">+44 (0) 20 3398 8300</a>,
+        <a href="https://www.harcusparker.co.uk" style="color:#802B7D;">www.harcusparker.co.uk</a>.
+      </p>
+      <p ${h}>What happens next</p>
+      <p ${p}>
+        Our next steps include involving as many other consultants as possible
+        in this claim, before formally issuing proceedings against the PMIs,
+        and, in due course, agreeing a new funding package with commercial
+        litigation funders.
+      </p>
+      <p ${p}>Kind regards,</p>
+      <p style="font-size:14px;line-height:1.6;color:#263238;font-weight:bold;margin:0;">
+        Harcus Parker Limited
+      </p>
+    `
+  );
+
+  const text = `Dear ${name},
+
+Many thanks for taking the time to join our proposed legal proceedings. We look forward to working with you on this over the coming months.
+
+To that end, we attach the formal legal documents which you have signed, so that you can keep them for your own records.
+
+Your right to cancel
+
+You have a 14-calendar-day period from the date you signed the documents in which you may cancel your involvement in these proceedings, with immediate effect and without giving any reason, at no cost to you. To cancel, simply email FIPO@harcusparker.co.uk, stating, for example: "${cancelExample}" A cancellation form is also attached for your convenience, should you prefer to use it.
+
+Who we are
+
+Harcus Parker Limited is the firm of solicitors advising on these legal proceedings. Its registered address is 80 Strand, London WC2R 0DT, Tel: +44 (0) 20 3398 8300, www.harcusparker.co.uk.
+
+What happens next
+
+Our next steps include involving as many other consultants as possible in this claim, before formally issuing proceedings against the PMIs, and, in due course, agreeing a new funding package with commercial litigation funders.
+
+Kind regards,
+
+Harcus Parker Limited`;
+
+  const attachments = [];
+  const cancellationForm = getCancellationFormAttachment();
+  if (cancellationForm) attachments.push(cancellationForm);
+
+  const signedPdf = options.signedDocumentsPdf;
+  if (signedPdf) {
+    attachments.push({
+      filename: "FIPO-Legal-Documents.pdf",
+      content: signedPdf,
+      contentType: "application/pdf",
+    });
+  }
+
+  const result = await sendMail({
+    to: user.email,
+    subject: "Welcome — your registration onto the proposed legal proceedings",
+    html,
+    text,
+    attachments,
+  });
+
+  if (!result.ok && attachments.length) {
+    console.error(
+      "Claim welcome email with attachments failed, retrying without signed PDF:",
+      result.error
+    );
+    const formOnly = attachments.filter((file) =>
+      String(file.filename).endsWith(".docx")
+    );
+    const retry = await sendMail({
+      to: user.email,
+      subject: "Welcome — your registration onto the proposed legal proceedings",
+      html,
+      text,
+      attachments: formOnly,
+    });
+    return retry;
+  }
+
+  return result;
+}
+
+/**
+ * Confirmation email sent once an application is submitted for review.
+ * Claimants receive the Harcus Parker welcome letter with attachments.
+ */
+export async function sendApplicationSubmittedEmail(user, application, options = {}) {
+  if (application?.applicationType === "CLAIMANT") {
+    return sendClaimWelcomeEmail(user, application, options);
+  }
+
   const appBase = process.env.APP_BASE_URL || "http://localhost:3000";
   const dashboardUrl = `${appBase}/dashboard`;
   const name = user.firstName ? `${user.firstName}` : "there";
-  const isClaimant = application?.applicationType === "CLAIMANT";
 
   const html = baseTemplate(
     "Your application has been submitted",
     `
       <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
-        Thank you, ${name}. Your ${isClaimant ? "claimant" : "supporter"}
-        application has been submitted successfully and is now
-        ${isClaimant ? "under review by the FIPO legal team" : "confirmed"}.
+        Thank you, ${name}. Your supporter application has been submitted
+        successfully and is now confirmed.
       </p>
-      ${
-        isClaimant
-          ? `<p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
-               Our team typically reviews applications within 5–10 working days.
-               We'll email you as soon as there's an update.
-             </p>`
-          : `<p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
-               Thank you for supporting the FIPO Fair Pay Action Group.
-             </p>`
-      }
+      <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;">
+        Thank you for supporting the FIPO Fair Pay Action Group.
+      </p>
       <a href="${dashboardUrl}"
         style="display:inline-block;background:#802B7D;color:#ffffff;text-decoration:none;
         font-size:14px;font-weight:bold;padding:12px 28px;border-radius:8px;letter-spacing:1px;">
@@ -301,9 +496,7 @@ export async function sendApplicationSubmittedEmail(user, application) {
 
   const text = `Thank you, ${name}.
 
-Your ${isClaimant ? "claimant" : "supporter"} application has been submitted successfully${
-    isClaimant ? " and is now under review by the FIPO legal team." : "."
-  }
+Your supporter application has been submitted successfully.
 
 View your dashboard: ${dashboardUrl}
 
@@ -311,9 +504,7 @@ View your dashboard: ${dashboardUrl}
 
   return sendMail({
     to: user.email,
-    subject: isClaimant
-      ? "Your FIPO claimant application is under review"
-      : "Your FIPO application is confirmed",
+    subject: "Your FIPO application is confirmed",
     html,
     text,
   });
