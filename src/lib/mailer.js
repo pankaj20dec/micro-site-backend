@@ -13,9 +13,11 @@ const CANCELLATION_FORM_TYPE =
 
 /**
  * Email transport:
- *   EMAIL_TRANSPORT=mailjet-api — HTTPS (works on DigitalOcean; SMTP port 587 is often blocked)
- *   SMTP_HOST + SMTP_PORT      — nodemailer SMTP
- *   (neither)                  — console stub [EMAIL:STUB]
+ *   EMAIL_TRANSPORT=zoho        — Zoho SMTP (smtp.zoho.com:465 SSL)
+ *   EMAIL_TRANSPORT=smtp        — generic SMTP via SMTP_HOST / SMTP_PORT
+ *   EMAIL_TRANSPORT=mailjet-api — Mailjet HTTPS (legacy)
+ *   SMTP_HOST + SMTP_PORT       — nodemailer SMTP
+ *   (neither)                   — console stub [EMAIL:STUB]
  */
 let transporter = null;
 let usingStub = false;
@@ -62,10 +64,24 @@ function getCancellationFormAttachment() {
   return cancellationFormAttachment;
 }
 
+function zohoSmtpHost() {
+  if (process.env.SMTP_HOST?.trim()) return process.env.SMTP_HOST.trim();
+
+  const region = (process.env.ZOHO_REGION || "").trim().toLowerCase();
+  const pro =
+    (process.env.ZOHO_PRO || "").trim().toLowerCase() === "true" ||
+    (process.env.ZOHO_PRO || "").trim() === "1";
+  const prefix = pro ? "smtppro" : "smtp";
+
+  if (region === "eu") return `${prefix}.zoho.eu`;
+  if (region === "in") return `${prefix}.zoho.in`;
+  return `${prefix}.zoho.com`;
+}
+
 function resolveTransportMode() {
   const explicit = (process.env.EMAIL_TRANSPORT || "").trim().toLowerCase();
   if (explicit === "mailjet-api" || explicit === "mailjet") return "mailjet-api";
-  if (explicit === "smtp") return "smtp";
+  if (explicit === "zoho" || explicit === "smtp") return "smtp";
 
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
   if (SMTP_HOST && SMTP_PORT) return "smtp";
@@ -78,19 +94,34 @@ function getTransporter() {
   if (transporter) return transporter;
 
   transportMode = resolveTransportMode();
+  const explicit = (process.env.EMAIL_TRANSPORT || "").trim().toLowerCase();
+  const useZoho = explicit === "zoho";
 
   if (transportMode === "smtp") {
-    const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+    const SMTP_HOST = useZoho ? zohoSmtpHost() : process.env.SMTP_HOST;
+    const SMTP_PORT = Number(process.env.SMTP_PORT || (useZoho ? 465 : 587));
+    const { SMTP_USER, SMTP_PASS } = process.env;
+    const secure =
+      process.env.SMTP_SECURE === "true" ||
+      SMTP_PORT === 465 ||
+      (useZoho && process.env.SMTP_SECURE !== "false");
     usingStub = false;
     transporter = nodemailer.createTransport({
       host: SMTP_HOST,
-      port: Number(SMTP_PORT),
-      secure: process.env.SMTP_SECURE === "true" || Number(SMTP_PORT) === 465,
+      port: SMTP_PORT,
+      secure,
+      requireTLS: !secure,
       auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
     });
     console.log(
-      `[EMAIL] SMTP transport: ${SMTP_HOST}:${SMTP_PORT} (auth=${Boolean(SMTP_USER && SMTP_PASS)})`
+      `[EMAIL] SMTP transport: ${SMTP_HOST}:${SMTP_PORT} ssl=${secure} (auth=${Boolean(SMTP_USER && SMTP_PASS)})`
     );
+    const fromEmail = parseFromAddress(EMAIL_FROM).email;
+    if (SMTP_USER && fromEmail && SMTP_USER.toLowerCase() !== fromEmail.toLowerCase()) {
+      console.warn(
+        `[EMAIL] EMAIL_FROM (${fromEmail}) should match SMTP_USER (${SMTP_USER}) for Zoho.`
+      );
+    }
   } else if (transportMode === "mailjet-api") {
     usingStub = false;
     console.log("[EMAIL] Mailjet API transport (HTTPS)");
@@ -367,6 +398,15 @@ export async function sendClaimWelcomeEmail(user, application, options = {}) {
         To that end, we attach the formal legal documents which you have signed,
         so that you can keep them for your own records.
       </p>
+      ${
+        options.witnessPending
+          ? `<p ${p}>
+               Your witness has not yet signed the Litigation Management Agreement.
+               Once they have signed, we will email you the complete signed documents
+               for your records.
+             </p>`
+          : ""
+      }
       <p ${h}>Your right to cancel</p>
       <p ${p}>
         You have a 14-calendar-day period from the date you signed the documents
@@ -404,7 +444,11 @@ export async function sendClaimWelcomeEmail(user, application, options = {}) {
 Many thanks for taking the time to join our proposed legal proceedings. We look forward to working with you on this over the coming months.
 
 To that end, we attach the formal legal documents which you have signed, so that you can keep them for your own records.
-
+${
+    options.witnessPending
+      ? "\nYour witness has not yet signed the Litigation Management Agreement. Once they have signed, we will email you the complete signed documents for your records.\n"
+      : ""
+  }
 Your right to cancel
 
 You have a 14-calendar-day period from the date you signed the documents in which you may cancel your involvement in these proceedings, with immediate effect and without giving any reason, at no cost to you. To cancel, simply email FIPO@harcusparker.co.uk, stating, for example: "${cancelExample}" A cancellation form is also attached for your convenience, should you prefer to use it.
@@ -461,6 +505,58 @@ Harcus Parker Limited`;
   }
 
   return result;
+}
+
+/**
+ * Follow-up after the witness signs, if the consultant already received the
+ * welcome email with an incomplete (claimant-only) PDF.
+ */
+export async function sendFullySignedDocumentsEmail(user, application, options = {}) {
+  const name = consultantName(user);
+  const safeName = escapeHtml(name);
+  const p =
+    'style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 16px;"';
+
+  const html = baseTemplate(
+    "Your legal documents are now fully signed",
+    `
+      <p ${p}>Dear ${safeName},</p>
+      <p ${p}>
+        Your witness has now signed the Litigation Management Agreement.
+        We attach the complete signed legal documents for your records.
+      </p>
+      <p ${p}>Kind regards,</p>
+      <p style="font-size:14px;line-height:1.6;color:#263238;font-weight:bold;margin:0;">
+        Harcus Parker Limited
+      </p>
+    `
+  );
+
+  const text = `Dear ${name},
+
+Your witness has now signed the Litigation Management Agreement. We attach the complete signed legal documents for your records.
+
+Kind regards,
+
+Harcus Parker Limited`;
+
+  const attachments = [];
+  const signedPdf = options.signedDocumentsPdf;
+  if (signedPdf) {
+    attachments.push({
+      filename: "FIPO-Legal-Documents-Fully-Signed.pdf",
+      content: signedPdf,
+      contentType: "application/pdf",
+    });
+  }
+
+  return sendMail({
+    to: user.email,
+    subject: "Your FIPO legal documents are now fully signed",
+    html,
+    text,
+    attachments,
+  });
 }
 
 /**

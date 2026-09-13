@@ -1,5 +1,6 @@
 import { prisma } from "../config/db.js";
 import { getEnvelopeStatus, isDocusignConfigured } from "./docusignClient.js";
+import { maybeSendFullySignedDocumentsEmail } from "./signedDocumentsEmail.js";
 
 /**
  * Fetch DocuSign envelope state once and persist changes to the application.
@@ -17,6 +18,9 @@ export async function getApplicationDocusignSnapshot(application, options = {}) 
       application.docusignStatus === "COMPLETED" &&
       application.legalSignedAt
     ) {
+      maybeSendFullySignedDocumentsEmail(application).catch((err) =>
+        console.error("Fully signed documents email failed:", err?.message || err)
+      );
       // Still return a minimal remote snapshot so the UI can show completion
       // without another DocuSign API call.
       return {
@@ -98,6 +102,12 @@ export async function getApplicationDocusignSnapshot(application, options = {}) 
       where: { id: application.id },
       data: updateData,
     });
+
+    if (resolvedRemote.status === "COMPLETED") {
+      maybeSendFullySignedDocumentsEmail(updated).catch((err) =>
+        console.error("Fully signed documents email failed:", err?.message || err)
+      );
+    }
 
     return { application: updated, remote: resolvedRemote, rateLimited: false };
   } catch (err) {

@@ -7,6 +7,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { sendApplicationSubmittedEmail, sendSupporterMemberEmail, sendSaveResumeEmail } from "../lib/mailer.js";
 import { resolveAppBaseUrl } from "../lib/appBaseUrl.js";
 import { getEnvelopeCombinedPdf } from "../lib/docusignClient.js";
+import { markFullySignedDocumentsEmailSent } from "../lib/signedDocumentsEmail.js";
 import {
   createEvidenceUploadTarget,
   deleteEvidenceFile,
@@ -232,6 +233,14 @@ applicationRouter.patch("/step", async (req, res) => {
         })
         .then(async (user) => {
           if (!user) return;
+          const witness =
+            updated.stage2Data &&
+            typeof updated.stage2Data === "object" &&
+            updated.stage2Data.witness &&
+            typeof updated.stage2Data.witness === "object"
+              ? updated.stage2Data.witness
+              : {};
+          const witnessPending = !witness.declarationSigned;
           let signedDocumentsPdf = null;
           if (updated.applicationType === "CLAIMANT" && updated.docusignEnvelopeId) {
             try {
@@ -243,7 +252,14 @@ applicationRouter.patch("/step", async (req, res) => {
               );
             }
           }
-          return sendApplicationSubmittedEmail(user, updated, { signedDocumentsPdf });
+          const result = await sendApplicationSubmittedEmail(user, updated, {
+            signedDocumentsPdf,
+            witnessPending,
+          });
+          if (result?.ok && !witnessPending && updated.applicationType === "CLAIMANT") {
+            await markFullySignedDocumentsEmailSent(updated);
+          }
+          return result;
         })
         .catch((err) =>
           console.error("Submitted email failed:", err?.message || err)
