@@ -8,7 +8,8 @@
     "start": "node src/index.js",
     "postinstall": "prisma generate",
     "seed-admin": "node scripts/seedSuperAdmin.mjs",
-    "test-email": "node scripts/testEmail.mjs"
+    "test-email": "node scripts/testEmail.mjs",
+    "zoho-mail-token": "node scripts/zohoMailToken.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1079.0",
