@@ -9,13 +9,13 @@ if (!to) {
 
 const result = await sendMail({
   to,
-  subject: "FIPO Zoho SMTP test",
-  text: "If you received this, Zoho SMTP is working.",
-  html: "<p>If you received this, <strong>Zoho SMTP</strong> is working.</p>",
+  subject: "FIPO email test",
+  text: "If you received this, FIPO outgoing email is working.",
+  html: "<p>If you received this, <strong>FIPO outgoing email</strong> is working.</p>",
 });
 
 if (result.ok) {
-  console.log("Test email accepted by SMTP server.", result.id ? `id=${result.id}` : "");
+  console.log("Test email accepted.", result.id ? `id=${result.id}` : "");
 } else {
   console.error("Test email failed:", result.error);
   process.exit(1);
