@@ -37,8 +37,23 @@ let cancellationFormAttachment;
 
 function parseFromAddress(from) {
   const match = from.match(/^(.+?)\s*<([^>]+)>$/);
-  if (match) return { name: match[1].trim(), email: match[2].trim() };
+  if (match) return { name: match[1].trim().replace(/^"|"$/g, ""), email: match[2].trim() };
   return { name: "", email: from.trim() };
+}
+
+function fromDisplayName() {
+  return (
+    process.env.EMAIL_FROM_NAME?.trim() ||
+    parseFromAddress(EMAIL_FROM).name ||
+    "FIPO"
+  );
+}
+
+function zohoFromAddress() {
+  const email =
+    parseFromAddress(EMAIL_FROM).email || process.env.SMTP_USER?.trim() || "";
+  const name = fromDisplayName();
+  return name ? `${name} <${email}>` : email;
 }
 
 function consultantName(user) {
@@ -380,7 +395,7 @@ async function sendViaZohoMailApi({ to, subject, html, text, attachments = [] })
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      fromAddress: fromEmail,
+      fromAddress: zohoFromAddress(),
       toAddress: to,
       subject,
       content: html || text || "",
@@ -519,7 +534,7 @@ export async function sendMail({ to, subject, html, text, attachments = [] }) {
 
     const tx = transporter;
     const info = await tx.sendMail({
-      from: EMAIL_FROM,
+      from: zohoFromAddress() || EMAIL_FROM,
       to,
       subject,
       html,
