@@ -523,8 +523,8 @@ async function replaceTitleTabsWithAddressText(envelopeId, recipientId, titleTab
     value: address,
     locked: "true",
     required: "false",
-    font: tab.font || "arial",
-    fontSize: tab.fontSize || "size12",
+    font: tab.font || "timesNewRoman",
+    fontSize: tab.fontSize || "size11",
     bold: tab.bold || "false",
   }));
 
