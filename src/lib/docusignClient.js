@@ -5,6 +5,7 @@ import {
   isDocusignWebhookSecretConfigured,
   resolveDocusignWebhookUrl,
 } from "./appBaseUrl.js";
+import { convertDocxToPdf, fillDocxMergeFields, findLibreOffice, isWordDocument } from "./officePdf.js";
 
 const DEMO_AUTH_BASE = "https://account-d.docusign.com";
 const PROD_AUTH_BASE = "https://account.docusign.com";
@@ -19,6 +20,9 @@ let tokenExpiresAt = 0;
 const envelopeStatusCache = new Map();
 const ENVELOPE_STATUS_CACHE_MS = 60_000;
 const ENVELOPE_STATUS_CACHE_COMPLETED_MS = 5 * 60_000;
+
+/** @type {{ templateId: string; value: object; expiresAt: number } | null} */
+let templateDetailsCache = null;
 
 export function clearEnvelopeStatusCache(envelopeId) {
   if (envelopeId) envelopeStatusCache.delete(String(envelopeId));
@@ -206,9 +210,105 @@ async function docusignRequest(path, options = {}) {
   return data;
 }
 
+async function docusignDownload(path, accept = "*/*") {
+  const token = await getAccessToken();
+  const { apiBase, accountId } = getConfig();
+  const url = `${apiBase}/v2.1/accounts/${accountId}${path}`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: accept,
+    },
+  });
+  if (!res.ok) {
+    const err = new Error(`DocuSign download failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function replacePrimaryWordDocumentWithPdf(envelopeId, { name = "", address = "" } = {}) {
+  if (process.env.DOCUSIGN_CONVERT_PDF === "false") return false;
+
+  const soffice = await findLibreOffice();
+  if (!soffice) {
+    console.warn(
+      "[DOCUSIGN] LibreOffice not found — DocuSign will convert Word to PDF and fonts may change. Install libreoffice-writer on the droplet."
+    );
+    return false;
+  }
+
+  const meta = await docusignRequest(`/envelopes/${envelopeId}/documents`);
+  const docs = meta.envelopeDocuments || [];
+  const primary = docs.find((doc) => {
+    const type = String(doc.type || "").toLowerCase();
+    if (["summary", "certificate", "portfolio"].includes(type)) return false;
+    return String(doc.documentId) === "1" || isWordDocument(doc.name, doc.fileExtension || doc.type);
+  });
+  if (!primary?.documentId) return false;
+  const looksWord =
+    isWordDocument(primary.name, primary.fileExtension || primary.type) ||
+    String(primary.fileExtension || "").toLowerCase() === "docx" ||
+    String(primary.fileExtension || "").toLowerCase() === "doc";
+  if (!looksWord && String(primary.documentId) !== "1") {
+    return false;
+  }
+
+  const wordBuffer = await docusignDownload(
+    `/envelopes/${envelopeId}/documents/${primary.documentId}`
+  );
+  if (wordBuffer.slice(0, 4).toString() === "%PDF") {
+    return false;
+  }
+  const filled = await fillDocxMergeFields(wordBuffer, {
+    address,
+    Address: address,
+    name,
+    Name: name,
+    "Full Name": name,
+    "full name": name,
+    date: formatLetterDate(),
+    Date: formatLetterDate(),
+  });
+  const pdfBuffer = await convertDocxToPdf(filled);
+
+  await docusignRequest(`/envelopes/${envelopeId}/documents`, {
+    method: "PUT",
+    body: JSON.stringify({
+      documents: [
+        {
+          documentId: String(primary.documentId),
+          name: String(primary.name || "Engagement letter").replace(/\.[^.]+$/, ""),
+          fileExtension: "pdf",
+          documentBase64: pdfBuffer.toString("base64"),
+        },
+      ],
+    }),
+  });
+  console.log(
+    `[DOCUSIGN] Replaced Word document ${primary.documentId} with LibreOffice PDF (${pdfBuffer.length} bytes)`
+  );
+  return true;
+}
+
 export async function getTemplateDetails() {
   const { templateId } = getConfig();
-  return docusignRequest(`/templates/${templateId}?include=recipients,tabs`);
+  const now = Date.now();
+  if (
+    templateDetailsCache?.templateId === templateId &&
+    templateDetailsCache.value &&
+    now < templateDetailsCache.expiresAt
+  ) {
+    return templateDetailsCache.value;
+  }
+  const data = await docusignRequest(`/templates/${templateId}?include=recipients,tabs`);
+  templateDetailsCache = {
+    templateId,
+    value: data,
+    expiresAt: now + 5 * 60 * 1000,
+  };
+  return data;
 }
 
 function listSignerRoles(template) {
@@ -327,15 +427,69 @@ function isAgreementPartyTab(tab) {
   );
 }
 
-function isAddressDocGenField(field) {
-  const label = String(field?.label || field?.name || "")
+function isNameTab(tab) {
+  const label = normalizeTabLabel(tab);
+  return (
+    label === "name" ||
+    label === "full name" ||
+    label === "fullname" ||
+    label.includes("full name")
+  );
+}
+
+const LETTER_BODY_TAB_STYLE = {
+  font: "arial",
+  fontSize: "size11",
+  bold: "false",
+  italic: "false",
+  underline: "false",
+  fontColor: "black",
+};
+
+function formatLetterDate(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  const safe = Number.isNaN(date.getTime()) ? new Date() : date;
+  return safe.toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function docGenFieldLabel(field) {
+  return String(field?.label || field?.name || "")
     .replace(/[{}]/g, "")
     .replace(/[_/-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+function isAddressDocGenField(field) {
+  const label = docGenFieldLabel(field);
   if (!label || label.includes("email") || label.includes("e-mail")) return false;
   return label === "address" || label.includes("address");
+}
+
+function isNameDocGenField(field) {
+  const label = docGenFieldLabel(field);
+  return (
+    label === "name" ||
+    label === "full name" ||
+    label === "fullname" ||
+    label.includes("full name") ||
+    label === "consultant name"
+  );
+}
+
+function isDateDocGenField(field) {
+  const label = docGenFieldLabel(field);
+  return (
+    label === "date" ||
+    label === "letter date" ||
+    label === "dated" ||
+    label === "date signed"
+  );
 }
 
 async function populateEnvelopeDocGenFields(envelopeId, { address = "", name = "" } = {}) {
@@ -360,6 +514,12 @@ async function populateEnvelopeDocGenFields(envelopeId, { address = "", name = "
           .map((field) => {
             if (isAddressDocGenField(field) && String(address).trim()) {
               return { name: field.name, value: String(address).trim() };
+            }
+            if (isNameDocGenField(field) && String(name).trim()) {
+              return { name: field.name, value: String(name).trim() };
+            }
+            if (isDateDocGenField(field)) {
+              return { name: field.name, value: formatLetterDate() };
             }
             if (
               isAgreementPartyTab({ tabLabel: field.label, name: field.name }) &&
@@ -419,13 +579,18 @@ function resolveRequiredTextTabValue(tab, name, address = "", useTitleAsAddress 
     return name;
   }
   if (label.includes("date")) {
-    return new Date().toLocaleDateString("en-GB");
+    return formatLetterDate();
   }
-  return name || "N/A";
+  return String(name || "N/A").trim();
 }
 
 function shouldPrefillTextTab(tab) {
-  return isRequiredTab(tab) || isAddressTab(tab) || isAgreementPartyTab(tab);
+  return (
+    isRequiredTab(tab) ||
+    isAddressTab(tab) ||
+    isAgreementPartyTab(tab) ||
+    isNameTab(tab)
+  );
 }
 
 function buildTemplateRole(signerTemplate, { email, name, clientUserId, address = "" }) {
@@ -444,6 +609,9 @@ function buildTemplateRole(signerTemplate, { email, name, clientUserId, address 
     textTabs.push({
       tabLabel: tab.tabLabel,
       value,
+      locked: "true",
+      disableAutoSize: isNameTab(tab) ? "false" : undefined,
+      ...LETTER_BODY_TAB_STYLE,
     });
   }
 
@@ -461,9 +629,53 @@ function mapPrefillableTabs(list, { name, address = "", useTitleAsAddress = fals
     .map((tab) => ({
       tabId: tab.tabId,
       value: resolveRequiredTextTabValue(tab, name, address, useTitleAsAddress),
+      locked: "true",
+      disableAutoSize: isNameTab(tab) ? "false" : undefined,
+      ...LETTER_BODY_TAB_STYLE,
       ...(useTitleAsAddress ? { width: String(Math.max(Number(tab.width) || 0, 220)) } : {}),
     }))
     .filter((tab) => String(tab.value || "").trim());
+}
+
+async function flattenLetterDateTabs(envelopeId, recipientId, tabs) {
+  const dateSignedTabs = tabs?.dateSignedTabs || [];
+  const dateTabs = tabs?.dateTabs || [];
+  if (!dateSignedTabs.length && !dateTabs.length) return;
+
+  const textTabs = [...dateSignedTabs, ...dateTabs].map((tab, index) => ({
+    documentId: String(tab.documentId || "1"),
+    pageNumber: String(tab.pageNumber || "1"),
+    xPosition: String(tab.xPosition ?? "90"),
+    yPosition: String(tab.yPosition ?? "140"),
+    tabLabel: tab.tabLabel || `letter-date-${index + 1}`,
+    value: formatLetterDate(),
+    locked: "true",
+    required: "false",
+    disableAutoSize: "false",
+    ...LETTER_BODY_TAB_STYLE,
+  }));
+
+  try {
+    await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+      method: "DELETE",
+      body: JSON.stringify({
+        ...(dateSignedTabs.length
+          ? { dateSignedTabs: dateSignedTabs.map((tab) => ({ tabId: tab.tabId })) }
+          : {}),
+        ...(dateTabs.length
+          ? { dateTabs: dateTabs.map((tab) => ({ tabId: tab.tabId })) }
+          : {}),
+      }),
+    });
+  } catch (err) {
+    console.warn("DocuSign date tab remove failed:", err?.message || err);
+    return;
+  }
+
+  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+    method: "POST",
+    body: JSON.stringify({ textTabs }),
+  });
 }
 
 async function prefillRecipientRequiredTextTabs(
@@ -471,11 +683,15 @@ async function prefillRecipientRequiredTextTabs(
   recipientId,
   { name, address = "", useTitleAsAddress = false } = {}
 ) {
-  if (!recipientId || (!name?.trim() && !address?.trim())) return;
+  if (!recipientId) return;
 
   const tabs = await docusignRequest(
     `/envelopes/${envelopeId}/recipients/${recipientId}/tabs`
   );
+  await flattenLetterDateTabs(envelopeId, recipientId, tabs);
+
+  if (!name?.trim() && !address?.trim()) return;
+
   const textTabs = mapPrefillableTabs(tabs.textTabs, { name, address });
 
   if (useTitleAsAddress && String(address || "").trim()) {
@@ -948,10 +1164,23 @@ export async function createEnvelopeFromTemplate({
     primaryName: signerName,
     primaryAddress: signerAddress,
   });
-  await populateEnvelopeDocGenFields(envelope.envelopeId, {
-    address: signerAddress,
-    name: signerName,
-  });
+
+  let convertedToPdf = false;
+  try {
+    convertedToPdf = await replacePrimaryWordDocumentWithPdf(envelope.envelopeId, {
+      name: signerName,
+      address: signerAddress,
+    });
+  } catch (err) {
+    console.warn("DocuSign LibreOffice PDF convert failed:", err?.message || err);
+  }
+
+  if (!convertedToPdf) {
+    await populateEnvelopeDocGenFields(envelope.envelopeId, {
+      address: signerAddress,
+      name: signerName,
+    });
+  }
 
   await docusignRequest(`/envelopes/${envelope.envelopeId}`, {
     method: "PUT",
@@ -968,6 +1197,7 @@ export async function createRecipientView({
   signerAddress = "",
   clientUserId,
   returnUrl,
+  skipPrefill = false,
 }) {
   const { roleName } = getConfig();
   const signers = await getEnvelopeSigners(envelopeId);
@@ -978,11 +1208,13 @@ export async function createRecipientView({
       (signer) => (signer.email || "").toLowerCase() === signerEmail.toLowerCase()
     );
 
-  await prefillEnvelopeRequiredTextTabs(envelopeId, {
-    primaryName: signerName,
-    primaryAddress: signerAddress,
-    witnessName: signers.find((s) => s.routingOrder === "2")?.name,
-  });
+  if (!skipPrefill) {
+    await prefillEnvelopeRequiredTextTabs(envelopeId, {
+      primaryName: signerName,
+      primaryAddress: signerAddress,
+      witnessName: signers.find((s) => s.routingOrder === "2")?.name,
+    });
+  }
 
   const viewRequest = {
     returnUrl,
