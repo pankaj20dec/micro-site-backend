@@ -448,22 +448,21 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
           legalSignedAt: null,
         },
       });
+    } else {
+      const syncedApplication = await syncDocusignStatusFromApi(
+        await prisma.application.findUnique({ where: { id: application.id } })
+      );
+      if (syncedApplication?.docusignStatus === "COMPLETED") {
+        return res.json({
+          envelopeId: syncedApplication.docusignEnvelopeId,
+          signingUrl: null,
+          docusignStatus: syncedApplication.docusignStatus,
+          legalSignedAt: syncedApplication.legalSignedAt,
+          alreadyCompleted: true,
+        });
+      }
+      envelopeId = syncedApplication?.docusignEnvelopeId || envelopeId;
     }
-
-    const syncedApplication = await syncDocusignStatusFromApi(
-      await prisma.application.findUnique({ where: { id: application.id } })
-    );
-    if (syncedApplication?.docusignStatus === "COMPLETED") {
-      return res.json({
-        envelopeId: syncedApplication.docusignEnvelopeId,
-        signingUrl: null,
-        docusignStatus: syncedApplication.docusignStatus,
-        legalSignedAt: syncedApplication.legalSignedAt,
-        alreadyCompleted: true,
-      });
-    }
-
-    envelopeId = syncedApplication?.docusignEnvelopeId || envelopeId;
 
     const signingUrl = await createRecipientView({
       envelopeId,
@@ -472,6 +471,7 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
       signerAddress,
       clientUserId: user.id,
       returnUrl,
+      skipPrefill: needsNewEnvelope,
     });
 
     const latest = await prisma.application.findUnique({ where: { id: application.id } });
