@@ -803,7 +803,7 @@ async function flattenFullNameTabs(envelopeId, recipientId, tabs, name) {
     xPosition: String(tab.xPosition ?? "90"),
     yPosition: String(tab.yPosition ?? "200"),
     tabLabel: tab.tabLabel || `full-name-${index + 1}`,
-    value: ` ${value}`,
+    value: value,
     locked: "true",
     required: "false",
     disableAutoSize: "false",
@@ -823,6 +823,35 @@ async function flattenFullNameTabs(envelopeId, recipientId, tabs, name) {
   }
 
   await saveRecipientLetterTabs(envelopeId, recipientId, "POST", { textTabs });
+}
+
+async function removeBakedNameOverlayTabs(envelopeId) {
+  const signers = await getEnvelopeSigners(envelopeId);
+  const primary = signers.find((signer) => signer.routingOrder === "1") || signers[0];
+  if (!primary?.recipientId) return;
+
+  const tabs = await docusignRequest(
+    `/envelopes/${envelopeId}/recipients/${primary.recipientId}/tabs`
+  );
+  const fullNameTabs = tabs.fullNameTabs || [];
+  const nameTextTabs = (tabs.textTabs || []).filter(
+    (tab) =>
+      isNameTab(tab) ||
+      /^full-name/i.test(String(tab.tabLabel || ""))
+  );
+  if (!fullNameTabs.length && !nameTextTabs.length) return;
+
+  await docusignRequest(`/envelopes/${envelopeId}/recipients/${primary.recipientId}/tabs`, {
+    method: "DELETE",
+    body: JSON.stringify({
+      ...(fullNameTabs.length
+        ? { fullNameTabs: fullNameTabs.map((tab) => ({ tabId: tab.tabId })) }
+        : {}),
+      ...(nameTextTabs.length
+        ? { textTabs: nameTextTabs.map((tab) => ({ tabId: tab.tabId })) }
+        : {}),
+    }),
+  });
 }
 
 async function prefillRecipientRequiredTextTabs(
@@ -970,15 +999,73 @@ function cloneTabPosition(tab, yOffset) {
     documentId: String(tab.documentId || "1"),
     pageNumber: String(tab.pageNumber || "1"),
     xPosition: String(tab.xPosition ?? "90"),
-    yPosition: String(Number(tab.yPosition || 0) + yOffset),
+    yPosition: String(Math.max(0, Number(tab.yPosition || 0) + yOffset)),
     width: String(Math.max(Number(tab.width) || 0, 220)),
     height: String(Math.max(Number(tab.height) || 0, 18)),
   };
 }
 
+function tabNearSignHere(tab, signHereTabs, yThreshold = 160) {
+  if (!signHereTabs?.length) return false;
+  return signHereTabs.some((sign) => {
+    if (String(sign.documentId || "1") !== String(tab.documentId || "1")) return false;
+    if (String(sign.pageNumber || "1") !== String(tab.pageNumber || "1")) return false;
+    return Math.abs(Number(sign.yPosition || 0) - Number(tab.yPosition || 0)) <= yThreshold;
+  });
+}
+
+function isWitnessIdentityTab(tab) {
+  return (
+    isNameTab(tab) ||
+    isAddressTab(tab) ||
+    /^witness/i.test(String(tab.tabLabel || "")) ||
+    /^full-name/i.test(String(tab.tabLabel || ""))
+  );
+}
+
+async function removeStrayWitnessIdentityTabs(envelopeId, recipientId) {
+  const tabs = await docusignRequest(
+    `/envelopes/${envelopeId}/recipients/${recipientId}/tabs`
+  );
+  const signHereTabs = tabs.signHereTabs || [];
+  const strayFullName = (tabs.fullNameTabs || []).filter(
+    (tab) => !tabNearSignHere(tab, signHereTabs)
+  );
+  const strayTitle = (tabs.titleTabs || []).filter(
+    (tab) => !tabNearSignHere(tab, signHereTabs)
+  );
+  const strayText = (tabs.textTabs || []).filter(
+    (tab) => isWitnessIdentityTab(tab) && !tabNearSignHere(tab, signHereTabs)
+  );
+  if (!strayFullName.length && !strayTitle.length && !strayText.length) {
+    return tabs;
+  }
+
+  try {
+    await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+      method: "DELETE",
+      body: JSON.stringify({
+        ...(strayFullName.length
+          ? { fullNameTabs: strayFullName.map((tab) => ({ tabId: tab.tabId })) }
+          : {}),
+        ...(strayTitle.length
+          ? { titleTabs: strayTitle.map((tab) => ({ tabId: tab.tabId })) }
+          : {}),
+        ...(strayText.length
+          ? { textTabs: strayText.map((tab) => ({ tabId: tab.tabId })) }
+          : {}),
+      }),
+    });
+  } catch (err) {
+    console.warn("DocuSign stray witness tab remove failed:", err?.message || err);
+  }
+
+  return docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`);
+}
+
 async function ensureWitnessIdentityTabs(
   envelopeId,
-  { witnessRecipientId, primaryRecipientId, name = "", address = "" } = {}
+  { witnessRecipientId, name = "", address = "" } = {}
 ) {
   if (!envelopeId || !witnessRecipientId) return;
   const witnessName = String(name || "").trim();
@@ -988,71 +1075,42 @@ async function ensureWitnessIdentityTabs(
   const tabs = await docusignRequest(
     `/envelopes/${envelopeId}/recipients/${witnessRecipientId}/tabs`
   );
+  const signHere = (tabs.signHereTabs || [])[0];
+  if (!signHere) return;
+
+  const nearbyText = (tabs.textTabs || []).filter((tab) =>
+    tabNearSignHere(tab, tabs.signHereTabs)
+  );
   const hasName =
-    (tabs.fullNameTabs || []).length > 0 || (tabs.textTabs || []).some(isNameTab);
+    (tabs.fullNameTabs || []).some((tab) => tabNearSignHere(tab, tabs.signHereTabs)) ||
+    nearbyText.some(isNameTab);
   const hasAddress =
-    (tabs.titleTabs || []).length > 0 || (tabs.textTabs || []).some(isAddressTab);
+    (tabs.titleTabs || []).some((tab) => tabNearSignHere(tab, tabs.signHereTabs)) ||
+    nearbyText.some(isAddressTab);
   if ((hasName || !witnessName) && (hasAddress || !witnessAddress)) return;
 
-  const yOffset = Number(process.env.DOCUSIGN_WITNESS_SIGN_Y_OFFSET || 120);
   const textTabs = [];
-  let sourceTabs = { textTabs: [], fullNameTabs: [], titleTabs: [] };
-  if (primaryRecipientId) {
-    try {
-      sourceTabs = await docusignRequest(
-        `/envelopes/${envelopeId}/recipients/${primaryRecipientId}/tabs`
-      );
-    } catch {
-      sourceTabs = { textTabs: [], fullNameTabs: [], titleTabs: [] };
-    }
-  }
-
   if (!hasName && witnessName) {
-    const source =
-      (sourceTabs.fullNameTabs || [])[0] ||
-      (sourceTabs.textTabs || []).find(isNameTab);
     textTabs.push({
       tabLabel: "witness full name",
-      value: ` ${witnessName}`,
+      value: witnessName,
       locked: "true",
       required: "false",
       ...LETTER_BODY_TAB_STYLE,
-      ...(source
-        ? cloneTabPosition(source, yOffset)
-        : {
-            documentId: "1",
-            pageNumber: process.env.DOCUSIGN_WITNESS_SIGN_PAGE || "1",
-            xPosition: process.env.DOCUSIGN_WITNESS_SIGN_X || "100",
-            yPosition: String(Number(process.env.DOCUSIGN_WITNESS_SIGN_Y || 500) - 40),
-            width: "220",
-            height: "18",
-          }),
+      ...cloneTabPosition(signHere, -36),
     });
   }
-
   if (!hasAddress && witnessAddress) {
-    const source =
-      (sourceTabs.titleTabs || [])[0] ||
-      (sourceTabs.textTabs || []).find(isAddressTab);
     textTabs.push({
       tabLabel: "witness address",
       value: witnessAddress,
       locked: "true",
       required: "false",
       ...LETTER_BODY_TAB_STYLE,
-      ...(source
-        ? cloneTabPosition(source, yOffset)
-        : {
-            documentId: "1",
-            pageNumber: process.env.DOCUSIGN_WITNESS_SIGN_PAGE || "1",
-            xPosition: process.env.DOCUSIGN_WITNESS_SIGN_X || "100",
-            yPosition: String(Number(process.env.DOCUSIGN_WITNESS_SIGN_Y || 500) - 18),
-            width: "280",
-            height: "36",
-          }),
+      ...cloneTabPosition(signHere, -18),
+      height: "32",
     });
   }
-
   if (!textTabs.length) return;
   await saveRecipientLetterTabs(envelopeId, witnessRecipientId, "POST", { textTabs });
 }
@@ -1089,6 +1147,7 @@ async function prefillEnvelopeRequiredTextTabs(
     !isSignerDone(witness.status)
   ) {
     try {
+      await removeStrayWitnessIdentityTabs(envelopeId, witness.recipientId);
       await prefillRecipientRequiredTextTabs(envelopeId, witness.recipientId, {
         name: witnessName,
         address: witnessAddress,
@@ -1097,7 +1156,6 @@ async function prefillEnvelopeRequiredTextTabs(
       });
       await ensureWitnessIdentityTabs(envelopeId, {
         witnessRecipientId: witness.recipientId,
-        primaryRecipientId: primary?.recipientId,
         name: witnessName,
         address: witnessAddress,
       });
@@ -1435,7 +1493,13 @@ export async function createEnvelopeFromTemplate({
     console.warn("DocuSign LibreOffice PDF convert failed:", err?.message || err);
   }
 
-  if (!convertedToPdf) {
+  if (convertedToPdf) {
+    try {
+      await removeBakedNameOverlayTabs(envelope.envelopeId);
+    } catch (err) {
+      console.warn("DocuSign name overlay remove failed:", err?.message || err);
+    }
+  } else {
     await populateEnvelopeDocGenFields(envelope.envelopeId, {
       address: signerAddress,
       name: signerName,
