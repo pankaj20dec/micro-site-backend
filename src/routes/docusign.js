@@ -408,7 +408,8 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
       envelopeId &&
       signerAddress &&
       isDocusignConfigured() &&
-      application.docusignStatus !== "COMPLETED"
+      application.docusignStatus !== "COMPLETED" &&
+      application.docusignStatus !== "SENT"
     ) {
       try {
         if (await envelopeMissingSignupAddress(envelopeId, signerAddress)) {
@@ -471,7 +472,7 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
       signerAddress,
       clientUserId: user.id,
       returnUrl,
-      skipPrefill: needsNewEnvelope,
+      skipPrefill: true,
     });
 
     const latest = await prisma.application.findUnique({ where: { id: application.id } });

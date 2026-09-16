@@ -486,13 +486,56 @@ function isNameTab(tab) {
 }
 
 const LETTER_BODY_TAB_STYLE = {
-  font: "timesnewroman",
+  font: "arial",
   fontSize: "size11",
   bold: "false",
   italic: "false",
   underline: "false",
   fontColor: "black",
 };
+
+const LETTER_BODY_TAB_FALLBACK_FONT = "arial";
+
+function applyTabFont(body, font) {
+  const next = { ...body };
+  for (const key of Object.keys(next)) {
+    if (!Array.isArray(next[key])) continue;
+    next[key] = next[key].map((tab) =>
+      tab && typeof tab === "object" ? { ...tab, font } : tab
+    );
+  }
+  return next;
+}
+
+function isInvalidTabFontError(err) {
+  const hay = `${err?.code || ""} ${err?.message || ""} ${JSON.stringify(err?.body || {})}`.toLowerCase();
+  return (
+    hay.includes("font") ||
+    err?.status === 400 ||
+    hay.includes("invalid_request_parameter")
+  );
+}
+
+async function saveRecipientLetterTabs(envelopeId, recipientId, method, body) {
+  const fonts = [LETTER_BODY_TAB_STYLE.font, LETTER_BODY_TAB_FALLBACK_FONT].filter(
+    (font, index, list) => font && list.indexOf(font) === index
+  );
+  let lastErr;
+  for (const font of fonts) {
+    try {
+      return await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+        method,
+        body: JSON.stringify(applyTabFont(body, font)),
+      });
+    } catch (err) {
+      lastErr = err;
+      const hasNext = font !== fonts[fonts.length - 1];
+      if (!hasNext || !isInvalidTabFontError(err)) throw err;
+      console.warn(`[DOCUSIGN] Tab font "${font}" rejected, retrying with ${LETTER_BODY_TAB_FALLBACK_FONT}`);
+    }
+  }
+  throw lastErr;
+}
 
 function formatLetterDate(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value);
@@ -685,10 +728,21 @@ function buildTemplateRole(signerTemplate, { email, name, clientUserId, address 
   return role;
 }
 
-function mapPrefillableTabs(list, { name, address = "", useTitleAsAddress = false } = {}) {
+function isPlaceholderPartyValue(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (isUnfilledTabValue(value)) return true;
+  return (
+    v.includes("(pending)") ||
+    v === "witness" ||
+    v.startsWith("witness ") ||
+    v.includes("@fipo-sign.local")
+  );
+}
+
+function mapPrefillableTabs(list, { name, address = "", useTitleAsAddress = false, overwrite = false } = {}) {
   return (list || [])
-    .filter((tab) => useTitleAsAddress || shouldPrefillTextTab(tab))
-    .filter((tab) => isUnfilledTabValue(tab.value))
+    .filter((tab) => useTitleAsAddress || shouldPrefillTextTab(tab) || overwrite)
+    .filter((tab) => overwrite || isPlaceholderPartyValue(tab.value))
     .map((tab) => ({
       tabId: tab.tabId,
       value: resolveRequiredTextTabValue(tab, name, address, useTitleAsAddress),
@@ -735,10 +789,7 @@ async function flattenLetterDateTabs(envelopeId, recipientId, tabs) {
     return;
   }
 
-  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
-    method: "POST",
-    body: JSON.stringify({ textTabs }),
-  });
+  await saveRecipientLetterTabs(envelopeId, recipientId, "POST", { textTabs });
 }
 
 async function flattenFullNameTabs(envelopeId, recipientId, tabs, name) {
@@ -771,16 +822,13 @@ async function flattenFullNameTabs(envelopeId, recipientId, tabs, name) {
     return;
   }
 
-  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
-    method: "POST",
-    body: JSON.stringify({ textTabs }),
-  });
+  await saveRecipientLetterTabs(envelopeId, recipientId, "POST", { textTabs });
 }
 
 async function prefillRecipientRequiredTextTabs(
   envelopeId,
   recipientId,
-  { name, address = "", useTitleAsAddress = false } = {}
+  { name, address = "", useTitleAsAddress = false, overwrite = false } = {}
 ) {
   if (!recipientId) return;
 
@@ -792,7 +840,11 @@ async function prefillRecipientRequiredTextTabs(
 
   if (!name?.trim() && !address?.trim()) return;
 
-  const textTabs = mapPrefillableTabs(tabs.textTabs, { name, address });
+  const textTabs = mapPrefillableTabs(tabs.textTabs, {
+    name,
+    address,
+    overwrite,
+  });
 
   if (useTitleAsAddress && String(address || "").trim()) {
     await replaceTitleTabsWithAddressText(
@@ -806,23 +858,18 @@ async function prefillRecipientRequiredTextTabs(
       name,
       address,
       useTitleAsAddress,
+      overwrite,
     });
     if (!textTabs.length && !titleTabs.length) return;
-    await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
-      method: "PUT",
-      body: JSON.stringify({
-        ...(textTabs.length ? { textTabs } : {}),
-        ...(titleTabs.length ? { titleTabs } : {}),
-      }),
+    await saveRecipientLetterTabs(envelopeId, recipientId, "PUT", {
+      ...(textTabs.length ? { textTabs } : {}),
+      ...(titleTabs.length ? { titleTabs } : {}),
     });
     return;
   }
 
   if (!textTabs.length) return;
-  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
-    method: "PUT",
-    body: JSON.stringify({ textTabs }),
-  });
+  await saveRecipientLetterTabs(envelopeId, recipientId, "PUT", { textTabs });
 }
 
 async function replaceTitleTabsWithAddressText(envelopeId, recipientId, titleTabs, address) {
@@ -853,10 +900,7 @@ async function replaceTitleTabsWithAddressText(envelopeId, recipientId, titleTab
     console.warn("DocuSign witness title tab remove failed:", err?.message || err);
   }
 
-  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
-    method: "POST",
-    body: JSON.stringify({ textTabs }),
-  });
+  await saveRecipientLetterTabs(envelopeId, recipientId, "POST", { textTabs });
 }
 
 async function prefillDocumentAddressTabs(envelopeId, address) {
@@ -902,25 +946,115 @@ async function ensureAnchoredAddressTab(envelopeId, recipientId, address) {
     const hasAddressTab = (tabs.textTabs || []).some(isAddressTab);
     if (hasAddressTab) return;
 
-    await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
-      method: "POST",
-      body: JSON.stringify({
-        textTabs: [
-          {
-            tabLabel: "address",
-            value,
-            locked: "true",
-            anchorString: "{{address}}",
-            anchorIgnoreIfNotPresent: "true",
-            anchorCaseSensitive: "false",
-            anchorMatchWholeWord: "true",
-          },
-        ],
-      }),
+    await saveRecipientLetterTabs(envelopeId, recipientId, "POST", {
+      textTabs: [
+        {
+          tabLabel: "address",
+          value,
+          locked: "true",
+          anchorString: "{{address}}",
+          anchorIgnoreIfNotPresent: "true",
+          anchorCaseSensitive: "false",
+          anchorMatchWholeWord: "true",
+          ...LETTER_BODY_TAB_STYLE,
+        },
+      ],
     });
   } catch (err) {
     console.warn("DocuSign anchored address tab failed:", err?.message || err);
   }
+}
+
+function cloneTabPosition(tab, yOffset) {
+  return {
+    documentId: String(tab.documentId || "1"),
+    pageNumber: String(tab.pageNumber || "1"),
+    xPosition: String(tab.xPosition ?? "90"),
+    yPosition: String(Number(tab.yPosition || 0) + yOffset),
+    width: String(Math.max(Number(tab.width) || 0, 220)),
+    height: String(Math.max(Number(tab.height) || 0, 18)),
+  };
+}
+
+async function ensureWitnessIdentityTabs(
+  envelopeId,
+  { witnessRecipientId, primaryRecipientId, name = "", address = "" } = {}
+) {
+  if (!envelopeId || !witnessRecipientId) return;
+  const witnessName = String(name || "").trim();
+  const witnessAddress = String(address || "").trim();
+  if (!witnessName && !witnessAddress) return;
+
+  const tabs = await docusignRequest(
+    `/envelopes/${envelopeId}/recipients/${witnessRecipientId}/tabs`
+  );
+  const hasName =
+    (tabs.fullNameTabs || []).length > 0 || (tabs.textTabs || []).some(isNameTab);
+  const hasAddress =
+    (tabs.titleTabs || []).length > 0 || (tabs.textTabs || []).some(isAddressTab);
+  if ((hasName || !witnessName) && (hasAddress || !witnessAddress)) return;
+
+  const yOffset = Number(process.env.DOCUSIGN_WITNESS_SIGN_Y_OFFSET || 120);
+  const textTabs = [];
+  let sourceTabs = { textTabs: [], fullNameTabs: [], titleTabs: [] };
+  if (primaryRecipientId) {
+    try {
+      sourceTabs = await docusignRequest(
+        `/envelopes/${envelopeId}/recipients/${primaryRecipientId}/tabs`
+      );
+    } catch {
+      sourceTabs = { textTabs: [], fullNameTabs: [], titleTabs: [] };
+    }
+  }
+
+  if (!hasName && witnessName) {
+    const source =
+      (sourceTabs.fullNameTabs || [])[0] ||
+      (sourceTabs.textTabs || []).find(isNameTab);
+    textTabs.push({
+      tabLabel: "witness full name",
+      value: ` ${witnessName}`,
+      locked: "true",
+      required: "false",
+      ...LETTER_BODY_TAB_STYLE,
+      ...(source
+        ? cloneTabPosition(source, yOffset)
+        : {
+            documentId: "1",
+            pageNumber: process.env.DOCUSIGN_WITNESS_SIGN_PAGE || "1",
+            xPosition: process.env.DOCUSIGN_WITNESS_SIGN_X || "100",
+            yPosition: String(Number(process.env.DOCUSIGN_WITNESS_SIGN_Y || 500) - 40),
+            width: "220",
+            height: "18",
+          }),
+    });
+  }
+
+  if (!hasAddress && witnessAddress) {
+    const source =
+      (sourceTabs.titleTabs || [])[0] ||
+      (sourceTabs.textTabs || []).find(isAddressTab);
+    textTabs.push({
+      tabLabel: "witness address",
+      value: witnessAddress,
+      locked: "true",
+      required: "false",
+      ...LETTER_BODY_TAB_STYLE,
+      ...(source
+        ? cloneTabPosition(source, yOffset)
+        : {
+            documentId: "1",
+            pageNumber: process.env.DOCUSIGN_WITNESS_SIGN_PAGE || "1",
+            xPosition: process.env.DOCUSIGN_WITNESS_SIGN_X || "100",
+            yPosition: String(Number(process.env.DOCUSIGN_WITNESS_SIGN_Y || 500) - 18),
+            width: "280",
+            height: "36",
+          }),
+    });
+  }
+
+  if (!textTabs.length) return;
+  await saveRecipientLetterTabs(envelopeId, witnessRecipientId, "POST", { textTabs });
 }
 
 async function prefillEnvelopeRequiredTextTabs(
@@ -933,23 +1067,50 @@ async function prefillEnvelopeRequiredTextTabs(
     signers.find((s) => s.routingOrder === "2" && s.recipientId !== primary?.recipientId) ||
     signers.find((s) => s.recipientId !== primary?.recipientId);
 
-  if (primary?.recipientId && (primaryName || primaryAddress)) {
-    await prefillRecipientRequiredTextTabs(envelopeId, primary.recipientId, {
-      name: primaryName,
-      address: primaryAddress,
-      useTitleAsAddress: true,
-    });
-    await ensureAnchoredAddressTab(envelopeId, primary.recipientId, primaryAddress);
+  if (
+    primary?.recipientId &&
+    (primaryName || primaryAddress) &&
+    !isSignerDone(primary.status)
+  ) {
+    try {
+      await prefillRecipientRequiredTextTabs(envelopeId, primary.recipientId, {
+        name: primaryName,
+        address: primaryAddress,
+        useTitleAsAddress: true,
+      });
+      await ensureAnchoredAddressTab(envelopeId, primary.recipientId, primaryAddress);
+    } catch (err) {
+      console.warn("DocuSign primary tab prefill failed:", err?.message || err);
+    }
   }
-  if (witness?.recipientId && (witnessName || witnessAddress)) {
-    await prefillRecipientRequiredTextTabs(envelopeId, witness.recipientId, {
-      name: witnessName,
-      address: witnessAddress,
-      useTitleAsAddress: true,
-    });
+  if (
+    witness?.recipientId &&
+    (witnessName || witnessAddress) &&
+    !isSignerDone(witness.status)
+  ) {
+    try {
+      await prefillRecipientRequiredTextTabs(envelopeId, witness.recipientId, {
+        name: witnessName,
+        address: witnessAddress,
+        useTitleAsAddress: true,
+        overwrite: true,
+      });
+      await ensureWitnessIdentityTabs(envelopeId, {
+        witnessRecipientId: witness.recipientId,
+        primaryRecipientId: primary?.recipientId,
+        name: witnessName,
+        address: witnessAddress,
+      });
+    } catch (err) {
+      console.warn("DocuSign witness tab prefill failed:", err?.message || err);
+    }
   }
-  if (primaryAddress) {
-    await prefillDocumentAddressTabs(envelopeId, primaryAddress);
+  if (primaryAddress && primary?.recipientId && !isSignerDone(primary.status)) {
+    try {
+      await prefillDocumentAddressTabs(envelopeId, primaryAddress);
+    } catch (err) {
+      console.warn("DocuSign document address prefill failed:", err?.message || err);
+    }
   }
 }
 
