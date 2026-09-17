@@ -1007,17 +1007,49 @@ function isWitnessIdentityTab(tab) {
   );
 }
 
-async function removeWitnessIdentityOverlays(envelopeId, recipientId) {
+function uniqueSignHereTabs(tabs) {
+  const kept = [];
+  for (const tab of tabs || []) {
+    const documentId = String(tab.documentId || "1");
+    const pageNumber = String(tab.pageNumber || "1");
+    const y = Number(tab.yPosition || 0);
+    const duplicate = kept.some(
+      (existing) =>
+        String(existing.documentId || "1") === documentId &&
+        String(existing.pageNumber || "1") === pageNumber &&
+        Math.abs(Number(existing.yPosition || 0) - y) < 40
+    );
+    if (!duplicate) kept.push(tab);
+  }
+  return kept;
+}
+
+function cloneTabBelowSignHere(tab, yOffset, height = 18) {
+  return {
+    documentId: String(tab.documentId || "1"),
+    pageNumber: String(tab.pageNumber || "1"),
+    xPosition: String(Math.min(Number(tab.xPosition || 90), 90)),
+    yPosition: String(Math.max(0, Number(tab.yPosition || 0) + yOffset)),
+    width: "260",
+    height: String(height),
+  };
+}
+
+async function syncWitnessIdentityTabs(
+  envelopeId,
+  recipientId,
+  { name = "", address = "" } = {}
+) {
   if (!envelopeId || !recipientId) return;
+
   const tabs = await docusignRequest(
     `/envelopes/${envelopeId}/recipients/${recipientId}/tabs`
   );
   const fullNameTabs = tabs.fullNameTabs || [];
   const titleTabs = tabs.titleTabs || [];
   const identityTextTabs = (tabs.textTabs || []).filter(isWitnessIdentityTab);
-  if (!fullNameTabs.length && !titleTabs.length && !identityTextTabs.length) return;
 
-  try {
+  if (fullNameTabs.length || titleTabs.length || identityTextTabs.length) {
     await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
       method: "DELETE",
       body: JSON.stringify({
@@ -1032,9 +1064,40 @@ async function removeWitnessIdentityOverlays(envelopeId, recipientId) {
           : {}),
       }),
     });
-  } catch (err) {
-    console.warn("DocuSign witness identity overlay delete failed:", err?.message || err);
   }
+
+  const witnessName = String(name || "").trim();
+  const witnessAddress = String(address || "").trim();
+  if (!witnessName && !witnessAddress) return;
+
+  const signHereTabs = uniqueSignHereTabs(tabs.signHereTabs);
+  if (!signHereTabs.length) return;
+
+  const textTabs = [];
+  for (const [index, signHere] of signHereTabs.entries()) {
+    if (witnessName) {
+      textTabs.push({
+        tabLabel: `witness full name ${index + 1}`,
+        value: witnessName,
+        locked: "true",
+        required: "false",
+        ...LETTER_BODY_TAB_STYLE,
+        ...cloneTabBelowSignHere(signHere, 56),
+      });
+    }
+    if (witnessAddress) {
+      textTabs.push({
+        tabLabel: `witness address ${index + 1}`,
+        value: witnessAddress,
+        locked: "true",
+        required: "false",
+        ...LETTER_BODY_TAB_STYLE,
+        ...cloneTabBelowSignHere(signHere, 74, 32),
+      });
+    }
+  }
+  if (!textTabs.length) return;
+  await saveRecipientLetterTabs(envelopeId, recipientId, "POST", { textTabs });
 }
 
 async function prefillEnvelopeRequiredTextTabs(
@@ -1065,9 +1128,12 @@ async function prefillEnvelopeRequiredTextTabs(
   }
   if (witness?.recipientId && !isSignerDone(witness.status)) {
     try {
-      await removeWitnessIdentityOverlays(envelopeId, witness.recipientId);
+      await syncWitnessIdentityTabs(envelopeId, witness.recipientId, {
+        name: witnessName,
+        address: witnessAddress,
+      });
     } catch (err) {
-      console.warn("DocuSign witness overlay remove failed:", err?.message || err);
+      console.warn("DocuSign witness identity tabs failed:", err?.message || err);
     }
   }
   if (primaryAddress && primary?.recipientId && !isSignerDone(primary.status)) {
@@ -1605,7 +1671,7 @@ async function addDynamicWitnessRecipient(
           name,
           routingOrder: String(routingOrder),
           roleName: witnessRoleName,
-          ...(address ? { title: address } : {}),
+          title: "",
           ...(clientUserId ? { clientUserId } : {}),
         },
       ],
@@ -1699,7 +1765,7 @@ export async function assignWitnessRecipient(
             recipientId: String(witness.recipientId),
             email,
             name,
-            ...(address ? { title: address } : {}),
+            title: "",
             roleName: witness.roleName || resolvedWitnessRoleName,
             ...(clientUserId ? { clientUserId } : {}),
           },
