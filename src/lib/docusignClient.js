@@ -21,6 +21,7 @@ const DEMO_API_BASE = "https://demo.docusign.net/restapi";
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
+let senderEmailNotificationsDisabled = false;
 
 /** @type {Map<string, { data: object; expiresAt: number }>} */
 const envelopeStatusCache = new Map();
@@ -128,6 +129,48 @@ export function getDocusignConsentUrl(redirectUri) {
     redirect_uri: redirectUri,
   });
   return `${authBase}/oauth/auth?${params.toString()}`;
+}
+
+async function disableApiSenderEmailNotifications() {
+  if (senderEmailNotificationsDisabled) return;
+  const { userId } = getConfig();
+  if (!userId || isPlaceholder(userId)) return;
+
+  await docusignRequest(`/users/${userId}/settings`, {
+    method: "PUT",
+    body: JSON.stringify({
+      senderEmailNotifications: {
+        envelopeComplete: "false",
+        changedSigner: "false",
+        senderEnvelopeDeclined: "false",
+        withdrawnConsent: "false",
+        recipientViewed: "false",
+        deliveryFailed: "false",
+      },
+    }),
+  });
+  senderEmailNotificationsDisabled = true;
+}
+
+async function stripEnvelopeCarbonCopies(envelopeId) {
+  const envelope = await docusignRequest(`/envelopes/${envelopeId}?include=recipients`);
+  const extra = [
+    ...(envelope.recipients?.carbonCopies || []),
+    ...(envelope.recipients?.certifiedDeliveries || []),
+    ...(envelope.recipients?.agents || []),
+    ...(envelope.recipients?.editors || []),
+    ...(envelope.recipients?.intermediaries || []),
+  ];
+  for (const recipient of extra) {
+    if (!recipient?.recipientId) continue;
+    try {
+      await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipient.recipientId}`, {
+        method: "DELETE",
+      });
+    } catch (err) {
+      console.warn("DocuSign extra recipient remove failed:", err?.message || err);
+    }
+  }
 }
 
 async function getAccessToken() {
@@ -722,10 +765,18 @@ function buildTemplateRole(
     }
   }
 
-  if (textTabs.length > 0 || titleTabs.length > 0) {
+  const checkboxTabs = (signerTemplate.tabs?.checkboxTabs || []).map((tab) => ({
+    tabLabel: tab.tabLabel,
+    selected: "true",
+    locked: "false",
+    required: "false",
+  }));
+
+  if (textTabs.length > 0 || titleTabs.length > 0 || checkboxTabs.length > 0) {
     role.tabs = {
       ...(textTabs.length ? { textTabs } : {}),
       ...(titleTabs.length ? { titleTabs } : {}),
+      ...(checkboxTabs.length ? { checkboxTabs } : {}),
     };
   }
 
@@ -1100,6 +1151,32 @@ async function syncWitnessIdentityTabs(
   await saveRecipientLetterTabs(envelopeId, recipientId, "POST", { textTabs });
 }
 
+async function prefillCheckboxTabsDefaultChecked(envelopeId, recipientId) {
+  if (!envelopeId || !recipientId) return;
+  const tabs = await docusignRequest(
+    `/envelopes/${envelopeId}/recipients/${recipientId}/tabs`
+  );
+  const checkboxTabs = tabs.checkboxTabs || [];
+  if (!checkboxTabs.length) return;
+
+  const alreadyChecked = checkboxTabs.some(
+    (tab) => String(tab.selected) === "true" || tab.selected === true
+  );
+  if (alreadyChecked) return;
+
+  await docusignRequest(`/envelopes/${envelopeId}/recipients/${recipientId}/tabs`, {
+    method: "PUT",
+    body: JSON.stringify({
+      checkboxTabs: checkboxTabs.map((tab) => ({
+        tabId: tab.tabId,
+        selected: "true",
+        locked: "false",
+        required: "false",
+      })),
+    }),
+  });
+}
+
 async function prefillEnvelopeRequiredTextTabs(
   envelopeId,
   { primaryName, primaryAddress = "", witnessName, witnessAddress = "" } = {}
@@ -1124,6 +1201,13 @@ async function prefillEnvelopeRequiredTextTabs(
       await ensureAnchoredAddressTab(envelopeId, primary.recipientId, primaryAddress);
     } catch (err) {
       console.warn("DocuSign primary tab prefill failed:", err?.message || err);
+    }
+  }
+  if (primary?.recipientId && !isSignerDone(primary.status)) {
+    try {
+      await prefillCheckboxTabsDefaultChecked(envelopeId, primary.recipientId);
+    } catch (err) {
+      console.warn("DocuSign checkbox prefill failed:", err?.message || err);
     }
   }
   if (witness?.recipientId && !isSignerDone(witness.status)) {
@@ -1397,6 +1481,12 @@ export async function createEnvelopeFromTemplate({
     createBody.eventNotification = eventNotification;
   }
 
+  try {
+    await disableApiSenderEmailNotifications();
+  } catch (err) {
+    console.warn("DocuSign sender email suppress failed:", err?.message || err);
+  }
+
   const envelope = await docusignRequest("/envelopes", {
     method: "POST",
     body: JSON.stringify(createBody),
@@ -1480,6 +1570,12 @@ export async function createEnvelopeFromTemplate({
     });
   }
 
+  try {
+    await stripEnvelopeCarbonCopies(envelope.envelopeId);
+  } catch (err) {
+    console.warn("DocuSign carbon-copy strip failed:", err?.message || err);
+  }
+
   await docusignRequest(`/envelopes/${envelope.envelopeId}`, {
     method: "PUT",
     body: JSON.stringify({ status: "sent" }),
@@ -1512,6 +1608,12 @@ export async function createRecipientView({
       primaryAddress: signerAddress,
       witnessName: signers.find((s) => s.routingOrder === "2")?.name,
     });
+  } else if (primary?.recipientId && !isSignerDone(primary.status)) {
+    try {
+      await prefillCheckboxTabsDefaultChecked(envelopeId, primary.recipientId);
+    } catch (err) {
+      console.warn("DocuSign checkbox prefill failed:", err?.message || err);
+    }
   }
 
   const viewRequest = {
