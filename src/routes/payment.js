@@ -122,6 +122,7 @@ paymentRouter.post("/stripe/create-intent", requireAuth, async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Number(membershipFee) * 100, // pence
       currency: "gbp",
+      payment_method_types: ["card"],
       metadata: { applicationId: application.id, userId: req.user.sub },
     });
 
@@ -137,7 +138,10 @@ paymentRouter.post("/stripe/create-intent", requireAuth, async (req, res) => {
     return res.json({ clientSecret: paymentIntent.client_secret });
   } catch (err) {
     console.error("Stripe create-intent error:", err);
-    return res.status(500).json({ error: "Failed to create payment intent" });
+    const stripeMessage = err?.raw?.message || err?.message;
+    return res.status(500).json({
+      error: stripeMessage || "Failed to create payment intent",
+    });
   }
 });
 
