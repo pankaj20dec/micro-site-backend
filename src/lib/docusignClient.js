@@ -35,6 +35,20 @@ export function clearEnvelopeStatusCache(envelopeId) {
   if (envelopeId) envelopeStatusCache.delete(String(envelopeId));
 }
 
+/** DocuSign uses this for a missing envelope AND for recipient-view identity mismatches. */
+export function isMissingEnvelopeError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "");
+  return (
+    code === "ENVELOPE_DOES_NOT_EXIST" ||
+    /envelope specified either does not exist/i.test(message) ||
+    /you have no rights to it/i.test(message)
+  );
+}
+
+export const MISSING_ENVELOPE_USER_MESSAGE =
+  "This signing session is no longer available. Click Restart signing, complete your signature again, then send it to your witness.";
+
 function isRateLimitError(err) {
   const message = String(err?.message || "").toLowerCase();
   return (
@@ -252,6 +266,9 @@ async function docusignRequest(path, options = {}) {
       err.code = "ENVELOPE_ALREADY_COMPLETED";
       err.message =
         "This document was already fully signed without a witness slot. Click Sign again in Stage 1 to start a fresh envelope with witness signing.";
+    }
+    if (isMissingEnvelopeError(err)) {
+      err.code = "ENVELOPE_DOES_NOT_EXIST";
     }
     throw err;
   }
@@ -1584,6 +1601,24 @@ export async function createEnvelopeFromTemplate({
   return envelope.envelopeId;
 }
 
+async function postRecipientView(envelopeId, viewRequest) {
+  try {
+    const view = await docusignRequest(`/envelopes/${envelopeId}/views/recipient`, {
+      method: "POST",
+      body: JSON.stringify(viewRequest),
+    });
+    return view.url;
+  } catch (err) {
+    if (!isMissingEnvelopeError(err) || !viewRequest.recipientId) throw err;
+    const { recipientId: _recipientId, ...withoutRecipientId } = viewRequest;
+    const view = await docusignRequest(`/envelopes/${envelopeId}/views/recipient`, {
+      method: "POST",
+      body: JSON.stringify(withoutRecipientId),
+    });
+    return view.url;
+  }
+}
+
 export async function createRecipientView({
   envelopeId,
   signerEmail,
@@ -1616,23 +1651,41 @@ export async function createRecipientView({
     }
   }
 
+  const email = String(primary?.email || signerEmail || "").trim();
+  const userName = String(primary?.name || signerName || "").trim();
+  const captiveId = String(primary?.clientUserId || clientUserId || "").trim();
+
   const viewRequest = {
     returnUrl,
-    authenticationMethod: "none",
-    email: signerEmail,
-    userName: signerName,
-    clientUserId,
+    authenticationMethod: captiveId ? "none" : "email",
+    email,
+    userName,
   };
+  if (captiveId) viewRequest.clientUserId = captiveId;
   if (primary?.recipientId) {
     viewRequest.recipientId = String(primary.recipientId);
   }
 
-  const view = await docusignRequest(`/envelopes/${envelopeId}/views/recipient`, {
-    method: "POST",
-    body: JSON.stringify(viewRequest),
-  });
-
-  return view.url;
+  try {
+    return await postRecipientView(envelopeId, viewRequest);
+  } catch (err) {
+    if (!isMissingEnvelopeError(err)) throw err;
+    if (
+      email.toLowerCase() !== String(signerEmail || "").trim().toLowerCase() ||
+      userName !== String(signerName || "").trim() ||
+      captiveId !== String(clientUserId || "").trim()
+    ) {
+      const retry = {
+        returnUrl,
+        authenticationMethod: clientUserId ? "none" : "email",
+        email: String(signerEmail || "").trim(),
+        userName: String(signerName || "").trim(),
+      };
+      if (clientUserId) retry.clientUserId = clientUserId;
+      return await postRecipientView(envelopeId, retry);
+    }
+    throw err;
+  }
 }
 
 function isSignerDone(status) {
@@ -1928,25 +1981,45 @@ export async function createWitnessRecipientView({
     witnessAddress,
   });
 
+  const email = String(witness?.email || witnessEmail || "").trim();
+  const userName = String(witness?.name || witnessName || "").trim();
+  const captiveId = String(witness?.clientUserId || witnessClientUserId || "").trim();
+
   const viewRequest = {
     returnUrl,
-    authenticationMethod: witnessClientUserId ? "none" : "email",
-    email: witnessEmail,
-    userName: witnessName,
+    authenticationMethod: captiveId ? "none" : "email",
+    email,
+    userName,
   };
-  if (witnessClientUserId) {
-    viewRequest.clientUserId = witnessClientUserId;
-  }
+  if (captiveId) viewRequest.clientUserId = captiveId;
   if (witness?.recipientId) {
     viewRequest.recipientId = String(witness.recipientId);
   }
 
-  const view = await docusignRequest(`/envelopes/${envelopeId}/views/recipient`, {
-    method: "POST",
-    body: JSON.stringify(viewRequest),
-  });
+  try {
+    return await postRecipientView(envelopeId, viewRequest);
+  } catch (err) {
+    if (!isMissingEnvelopeError(err)) throw err;
 
-  return view.url;
+    const retry = {
+      returnUrl,
+      authenticationMethod: witnessClientUserId ? "none" : "email",
+      email: String(witnessEmail || "").trim(),
+      userName: String(witnessName || "").trim(),
+    };
+    if (witnessClientUserId) retry.clientUserId = witnessClientUserId;
+
+    try {
+      return await postRecipientView(envelopeId, retry);
+    } catch (retryErr) {
+      if (!isMissingEnvelopeError(retryErr)) throw retryErr;
+      const mapped = new Error(
+        "Could not create a witness signing link. Click Restart signing, complete your signature again, then resend to your witness."
+      );
+      mapped.code = "CANNOT_REOPEN_SIGNING";
+      throw mapped;
+    }
+  }
 }
 
 export async function getEnvelopeStatus(envelopeId, options = {}) {

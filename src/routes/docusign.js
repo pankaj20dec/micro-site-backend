@@ -20,6 +20,8 @@ import {
   resolveDocusignWebhookUrl,
   extractSignupAddress,
   envelopeMissingSignupAddress,
+  isMissingEnvelopeError,
+  MISSING_ENVELOPE_USER_MESSAGE,
 } from "../lib/docusignClient.js";
 import { syncDocusignStatusFromApi, getApplicationDocusignSnapshot } from "../lib/docusignSync.js";
 import { maybeSendFullySignedDocumentsEmail } from "../lib/signedDocumentsEmail.js";
@@ -214,17 +216,21 @@ docusignRouter.get("/status", requireAuth, async (req, res) => {
     ).trim();
 
     if (forceRefresh && loaded.application.docusignEnvelopeId) {
-      await cleanupStaleEnvelopeRecipients(loaded.application.docusignEnvelopeId, {
-        activeWitnessEmail: witnessEmail || undefined,
-      });
+      try {
+        await cleanupStaleEnvelopeRecipients(loaded.application.docusignEnvelopeId, {
+          activeWitnessEmail: witnessEmail || undefined,
+        });
+      } catch (err) {
+        if (!isMissingEnvelopeError(err)) throw err;
+      }
     }
 
-    const { application: synced, remote, rateLimited } =
+    const { application: synced, remote, rateLimited, envelopeMissing } =
       await getApplicationDocusignSnapshot(loaded.application, { forceRefresh });
 
     return res.json({
-      envelopeId: synced.docusignEnvelopeId,
-      status: remote?.status || synced.docusignStatus,
+      envelopeId: envelopeMissing ? null : synced.docusignEnvelopeId,
+      status: envelopeMissing ? null : (remote?.status || synced.docusignStatus),
       completedDateTime: remote?.completedDateTime || synced.legalSignedAt || null,
       allSignersCompleted: remote?.allSignersCompleted ?? false,
       legalSignedAt: synced.legalSignedAt,
@@ -235,9 +241,20 @@ docusignRouter.get("/status", requireAuth, async (req, res) => {
       multipleSigners: !!remote?.multipleSigners,
       pendingSigners: remote?.pendingSigners || [],
       rateLimited,
+      envelopeMissing: !!envelopeMissing,
+      ...(envelopeMissing
+        ? { error: MISSING_ENVELOPE_USER_MESSAGE, code: "ENVELOPE_DOES_NOT_EXIST" }
+        : {}),
     });
   } catch (err) {
     console.error("DocuSign status error:", err);
+    if (isMissingEnvelopeError(err)) {
+      return res.status(400).json({
+        error: MISSING_ENVELOPE_USER_MESSAGE,
+        code: "ENVELOPE_DOES_NOT_EXIST",
+        envelopeMissing: true,
+      });
+    }
     return res.status(500).json({ error: "Failed to load DocuSign status" });
   }
 });
@@ -386,6 +403,10 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     if (!needsNewEnvelope && envelopeId && isDocusignConfigured()) {
       try {
         const remote = await getEnvelopeStatus(envelopeId);
+        const remoteStatus = String(remote.status || "").toUpperCase();
+        if (remoteStatus === "VOIDED" || remoteStatus === "DELETED") {
+          needsNewEnvelope = true;
+        }
         const signerCount = remote.signers?.length ?? 0;
         const hasStalePlaceholder = (remote.signers || []).some(
           (signer) =>
@@ -398,8 +419,10 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
         if ((signerCount > 2 || hasStalePlaceholder) && remote.status !== "COMPLETED") {
           needsNewEnvelope = true;
         }
-      } catch {
-        // keep existing envelope
+      } catch (err) {
+        if (isMissingEnvelopeError(err)) {
+          needsNewEnvelope = true;
+        }
       }
     }
 
@@ -484,6 +507,13 @@ docusignRouter.post("/send", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("DocuSign send error:", err);
+
+    if (isMissingEnvelopeError(err)) {
+      return res.status(400).json({
+        error: MISSING_ENVELOPE_USER_MESSAGE,
+        code: "ENVELOPE_DOES_NOT_EXIST",
+      });
+    }
 
     if (err.code === "consent_required") {
       const redirectUri = resolveDocusignOAuthRedirectUri(req, req.body?.returnBaseUrl);
@@ -701,6 +731,13 @@ docusignRouter.post("/witness/send", requireAuth, async (req, res) => {
       return res.status(400).json({
         error: err.message,
         availableRoles: err.availableRoles,
+      });
+    }
+
+    if (isMissingEnvelopeError(err) || err.code === "CANNOT_REOPEN_SIGNING") {
+      return res.status(400).json({
+        error: err.code === "CANNOT_REOPEN_SIGNING" ? err.message : MISSING_ENVELOPE_USER_MESSAGE,
+        code: err.code || "ENVELOPE_DOES_NOT_EXIST",
       });
     }
 

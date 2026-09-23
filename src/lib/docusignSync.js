@@ -1,5 +1,9 @@
 import { prisma } from "../config/db.js";
-import { getEnvelopeStatus, isDocusignConfigured } from "./docusignClient.js";
+import {
+  getEnvelopeStatus,
+  isDocusignConfigured,
+  isMissingEnvelopeError,
+} from "./docusignClient.js";
 import { maybeSendFullySignedDocumentsEmail } from "./signedDocumentsEmail.js";
 
 /**
@@ -112,12 +116,15 @@ export async function getApplicationDocusignSnapshot(application, options = {}) 
     return { application: updated, remote: resolvedRemote, rateLimited: false };
   } catch (err) {
     const rateLimited = !!err.rateLimited;
+    const envelopeMissing = isMissingEnvelopeError(err);
     if (rateLimited) {
       console.warn("DocuSign status sync rate-limited — using saved application status.");
+    } else if (envelopeMissing) {
+      console.warn("DocuSign envelope is missing or inaccessible:", application.docusignEnvelopeId);
     } else {
       console.warn("DocuSign status sync failed:", err.message);
     }
-    return { application, remote: null, rateLimited };
+    return { application, remote: null, rateLimited, envelopeMissing };
   }
 }
 
