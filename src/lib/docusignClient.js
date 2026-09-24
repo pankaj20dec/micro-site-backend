@@ -1953,6 +1953,18 @@ export async function assignWitnessRecipient(
   }
 }
 
+function buildRecipientViewRequest(returnUrl, { email, userName, clientUserId, recipientId }) {
+  const viewRequest = {
+    returnUrl,
+    authenticationMethod: clientUserId ? "none" : "email",
+    email: String(email || "").trim(),
+    userName: String(userName || "").trim(),
+  };
+  if (clientUserId) viewRequest.clientUserId = String(clientUserId).trim();
+  if (recipientId) viewRequest.recipientId = String(recipientId);
+  return viewRequest;
+}
+
 export async function createWitnessRecipientView({
   envelopeId,
   witnessEmail,
@@ -1981,45 +1993,94 @@ export async function createWitnessRecipientView({
     witnessAddress,
   });
 
-  const email = String(witness?.email || witnessEmail || "").trim();
-  const userName = String(witness?.name || witnessName || "").trim();
-  const captiveId = String(witness?.clientUserId || witnessClientUserId || "").trim();
+  const envelopeEmail = String(witness?.email || "").trim();
+  const envelopeName = String(witness?.name || "").trim();
+  const envelopeCaptiveId = String(witness?.clientUserId || "").trim();
+  const formEmail = String(witnessEmail || "").trim();
+  const formName = String(witnessName || "").trim();
+  const formCaptiveId = String(witnessClientUserId || "").trim();
+  const recipientId = witness?.recipientId ? String(witness.recipientId) : "";
 
-  const viewRequest = {
-    returnUrl,
-    authenticationMethod: captiveId ? "none" : "email",
-    email,
-    userName,
-  };
-  if (captiveId) viewRequest.clientUserId = captiveId;
-  if (witness?.recipientId) {
-    viewRequest.recipientId = String(witness.recipientId);
-  }
+  const attempts = [
+    {
+      email: envelopeEmail || formEmail,
+      userName: envelopeName || formName,
+      clientUserId: envelopeCaptiveId || undefined,
+      recipientId,
+    },
+    {
+      email: formEmail,
+      userName: formName,
+      clientUserId: envelopeCaptiveId || formCaptiveId || undefined,
+      recipientId,
+    },
+    {
+      email: envelopeEmail || formEmail,
+      userName: envelopeName || formName,
+      recipientId,
+    },
+    {
+      email: formEmail,
+      userName: formName,
+      clientUserId: formCaptiveId || undefined,
+    },
+    {
+      email: formEmail,
+      userName: formName,
+    },
+  ].filter((attempt) => attempt.email && attempt.userName);
 
-  try {
-    return await postRecipientView(envelopeId, viewRequest);
-  } catch (err) {
-    if (!isMissingEnvelopeError(err)) throw err;
-
-    const retry = {
-      returnUrl,
-      authenticationMethod: witnessClientUserId ? "none" : "email",
-      email: String(witnessEmail || "").trim(),
-      userName: String(witnessName || "").trim(),
-    };
-    if (witnessClientUserId) retry.clientUserId = witnessClientUserId;
-
+  let lastErr = null;
+  for (const attempt of attempts) {
     try {
-      return await postRecipientView(envelopeId, retry);
-    } catch (retryErr) {
-      if (!isMissingEnvelopeError(retryErr)) throw retryErr;
-      const mapped = new Error(
-        "Could not create a witness signing link. Click Restart signing, complete your signature again, then resend to your witness."
+      return await postRecipientView(
+        envelopeId,
+        buildRecipientViewRequest(returnUrl, attempt)
       );
-      mapped.code = "CANNOT_REOPEN_SIGNING";
-      throw mapped;
+    } catch (err) {
+      lastErr = err;
+      if (!isMissingEnvelopeError(err)) throw err;
     }
   }
+
+  if (recipientId && formEmail && formName) {
+    try {
+      await docusignRequest(`/envelopes/${envelopeId}/recipients`, {
+        method: "PUT",
+        body: JSON.stringify({
+          signers: [
+            {
+              recipientId,
+              email: formEmail,
+              name: formName,
+              title: "",
+              roleName: witness?.roleName || resolvedWitnessRoleName,
+              ...(formCaptiveId ? { clientUserId: formCaptiveId } : {}),
+            },
+          ],
+        }),
+      });
+      return await postRecipientView(
+        envelopeId,
+        buildRecipientViewRequest(returnUrl, {
+          email: formEmail,
+          userName: formName,
+          clientUserId: formCaptiveId || undefined,
+          recipientId,
+        })
+      );
+    } catch (err) {
+      lastErr = err;
+      if (!isMissingEnvelopeError(err)) throw err;
+    }
+  }
+
+  const mapped = new Error(
+    "Could not create a witness signing link. Go to Stage 1 and click Sign again, then return here to send it to your witness."
+  );
+  mapped.code = "CANNOT_REOPEN_SIGNING";
+  mapped.cause = lastErr;
+  throw mapped;
 }
 
 export async function getEnvelopeStatus(envelopeId, options = {}) {

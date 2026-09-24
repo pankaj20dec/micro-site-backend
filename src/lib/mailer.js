@@ -1031,6 +1031,7 @@ export async function sendWitnessSigningEmail({
   witnessName,
   claimantName,
   signingUrl,
+  validDays = 30,
 }) {
   const name = escapeHtml(witnessName?.trim() || "there");
   const who = escapeHtml(claimantName?.trim() || "a FIPO claimant");
@@ -1047,8 +1048,9 @@ export async function sendWitnessSigningEmail({
         for the FIPO Fair Pay Action Group.
       </p>
       <p style="font-size:14px;line-height:1.6;color:#4a4a4a;margin:0 0 20px;">
-        Click the button below to review and sign in DocuSign. When you have finished,
-        you will be returned to the FIPO homepage.
+        Click the button below when you are ready to review and sign in DocuSign.
+        This invitation stays valid for ${Number(validDays) || 30} days.
+        When you have finished, you will be returned to the FIPO homepage.
       </p>
       <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
         <tr>
@@ -1071,7 +1073,7 @@ export async function sendWitnessSigningEmail({
 
 ${claimantName?.trim() || "a FIPO claimant"} has asked you to witness and sign the Litigation Management Agreement for the FIPO Fair Pay Action Group.
 
-Open this link to review and sign in DocuSign:
+Open this link when you are ready to review and sign in DocuSign (valid for ${Number(validDays) || 30} days):
 ${signingUrl}
 
 When you have finished, you will be returned to the FIPO homepage.
