@@ -1,5 +1,4 @@
 import { Router } from "express";
-import express from "express";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { prisma } from "../config/db.js";
@@ -358,10 +357,7 @@ applicationRouter.post("/evidence/presign", async (req, res) => {
 });
 
 // POST /api/application/evidence/upload — upload via API (Spaces or local; avoids browser CORS to Spaces)
-applicationRouter.post(
-  "/evidence/upload",
-  express.raw({ type: () => true, limit: "20mb" }),
-  async (req, res) => {
+applicationRouter.post("/evidence/upload", async (req, res) => {
     try {
       const fileKey = String(req.headers["x-file-key"] || "");
       const rawName = req.headers["x-file-name"];
@@ -399,8 +395,7 @@ applicationRouter.post(
           : err.message || "Failed to upload evidence file";
       return res.status(500).json({ error: message });
     }
-  }
-);
+});
 
 // POST /api/application/evidence — save file metadata after upload
 applicationRouter.post("/evidence", async (req, res) => {

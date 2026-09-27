@@ -1,5 +1,6 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import { prisma } from "../config/db.js";
 import { requireAdmin, requireSuperAdmin } from "../middleware/auth.js";
 import { syncApplicationsDocusignStatus } from "../lib/docusignSync.js";
@@ -134,6 +135,56 @@ adminUsersRouter.post("/", requireSuperAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to create admin" });
+  }
+});
+
+// POST /api/admin/users/:id/impersonate — super admin opens a member session
+adminUsersRouter.post("/:id/impersonate", requireSuperAdmin, async (req, res) => {
+  try {
+    const target = await prisma.user.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, firstName: true, lastName: true, email: true, role: true },
+    });
+    if (!target) return res.status(404).json({ error: "Not found" });
+
+    if (target.id === req.user.sub) {
+      return res.status(400).json({ error: "You are already signed in as this account." });
+    }
+    if (target.role !== "USER") {
+      return res.status(403).json({ error: "You can only log in as a registered member (USER)." });
+    }
+
+    const secret = process.env.JWT_SECRET;
+    if (!secret) throw new Error("JWT_SECRET missing");
+
+    const token = jwt.sign(
+      {
+        sub: target.id,
+        email: target.email,
+        role: target.role,
+        impersonatedBy: req.user.sub,
+      },
+      secret,
+      { expiresIn: "8h" }
+    );
+
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user.sub,
+        action: "USER_IMPERSONATED",
+        targetId: target.id,
+        targetType: "User",
+        metadata: { email: target.email },
+      },
+    });
+
+    return res.json({
+      token,
+      user: target,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to start user session" });
   }
 });
 

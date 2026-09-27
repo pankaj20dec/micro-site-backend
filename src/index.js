@@ -42,9 +42,13 @@ app.use(
 // ─── Raw body for webhook signature verification ─────────────────────────────
 app.use("/api/payment/stripe/webhook", express.raw({ type: "application/json" }));
 app.use("/api/docusign/webhook", express.raw({ type: "*/*" }));
+app.use(
+  "/api/application/evidence/upload",
+  express.raw({ type: () => true, limit: "20mb" })
+);
 
 // ─── JSON body parser for all other routes ────────────────────────────────────
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.get("/api/health", async (_req, res) => {
