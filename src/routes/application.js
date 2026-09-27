@@ -15,6 +15,7 @@ import {
   saveEvidenceBuffer,
   sanitizeFileName,
 } from "../lib/spacesStorage.js";
+import { collectUploadBuffer, parseChunkHeaders } from "../lib/evidenceChunks.js";
 
 function signToken(user) {
   const secret = process.env.JWT_SECRET;
@@ -362,14 +363,10 @@ applicationRouter.post("/evidence/upload", async (req, res) => {
       const fileKey = String(req.headers["x-file-key"] || "");
       const rawName = req.headers["x-file-name"];
       const fileName = rawName ? decodeURIComponent(String(rawName)) : "upload.bin";
-      const buffer = req.body;
       const mimeType = String(req.headers["content-type"] || "application/octet-stream");
 
       if (!fileKey || fileKey.includes("..")) {
         return res.status(400).json({ error: "Invalid file key" });
-      }
-      if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-        return res.status(400).json({ error: "Empty file upload" });
       }
 
       const userId = await requireExistingUser(req, res);
@@ -380,7 +377,19 @@ applicationRouter.post("/evidence/upload", async (req, res) => {
         return res.status(403).json({ error: "Upload not allowed for this application" });
       }
 
-      const storage = await saveEvidenceBuffer(fileKey, buffer, mimeType);
+      let chunk;
+      try {
+        chunk = parseChunkHeaders(req);
+      } catch (err) {
+        return res.status(err.status || 400).json({ error: err.message });
+      }
+
+      const assembled = await collectUploadBuffer(fileKey, req.body, chunk);
+      if (!assembled) {
+        return res.status(202).json({ received: true });
+      }
+
+      const storage = await saveEvidenceBuffer(fileKey, assembled, mimeType);
 
       return res.status(201).json({
         fileKey,
@@ -388,6 +397,9 @@ applicationRouter.post("/evidence/upload", async (req, res) => {
         storage,
       });
     } catch (err) {
+      if (err.status === 413 || err.status === 400) {
+        return res.status(err.status).json({ error: err.message });
+      }
       console.error("Evidence upload error:", err);
       const message =
         process.env.NODE_ENV === "production"

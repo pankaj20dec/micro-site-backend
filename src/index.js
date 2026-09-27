@@ -81,6 +81,11 @@ app.use("/api/admin/site-settings", adminSiteSettingsRouter);
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.use((err, _req, res, _next) => {
+  if (err?.status === 413 || err?.type === "entity.too.large") {
+    return res.status(413).json({
+      error: "This file is too large. Please upload a PDF, JPG or PNG under 15 MB.",
+    });
+  }
   console.error("Unhandled API error:", err);
   res.status(500).json({ error: err.message ?? "Internal server error" });
 });
