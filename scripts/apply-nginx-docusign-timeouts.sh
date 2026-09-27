@@ -24,41 +24,50 @@ EOF
 echo "Wrote $SNIPPET"
 
 INCLUDE_LINE='include snippets/fipo-long-timeouts.conf;'
-patched=0
 
 shopt -s nullglob
-for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf /etc/nginx/nginx.conf; do
   [[ -f "$conf" ]] || continue
   [[ "$(basename "$conf")" == "fipo-uploads.conf" ]] && continue
-  if grep -q 'fipo-long-timeouts.conf' "$conf"; then
-    echo "Already included in $conf"
-    continue
-  fi
-  if ! grep -q 'proxy_pass' "$conf"; then
-    continue
-  fi
   python3 - "$conf" "$INCLUDE_LINE" <<'PY'
+import re
 import sys
 from pathlib import Path
 path = Path(sys.argv[1])
 include = sys.argv[2]
 text = path.read_text()
-if include in text:
-    raise SystemExit(0)
-out = []
-inserted = False
-for line in text.splitlines(True):
-    out.append(line)
-    stripped = line.strip()
-    if stripped.startswith("proxy_pass") and not inserted:
-        indent = line[: len(line) - len(line.lstrip())]
-        out.append(f"{indent}{include}\n")
-        inserted = True
-if inserted:
-    path.write_text("".join(out))
-    print(f"Patched {path}")
+original = text
+if "proxy_pass" in text and include not in text:
+    out = []
+    inserted = False
+    for line in text.splitlines(True):
+        out.append(line)
+        stripped = line.strip()
+        if stripped.startswith("proxy_pass") and not inserted:
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(f"{indent}{include}\n")
+            inserted = True
+    if inserted:
+        text = "".join(out)
+        print(f"Patched timeouts in {path}")
+
+# Location/server blocks often override the http-level 20m with nginx's 1m default.
+if re.search(r"\bserver\s*\{", text) and "client_max_body_size" not in text:
+    text, n = re.subn(
+        r"(server\s*\{)",
+        r"\1\n    client_max_body_size 20m;",
+        text,
+        count=1,
+    )
+    if n:
+        print(f"Set client_max_body_size in {path}")
+elif "client_max_body_size 1m" in text:
+    text = text.replace("client_max_body_size 1m", "client_max_body_size 20m")
+    print(f"Raised 1m upload limit in {path}")
+
+if text != original:
+    path.write_text(text)
 PY
-  patched=$((patched + 1))
 done
 
 nginx -t
