@@ -7,11 +7,57 @@ import { syncApplicationsDocusignStatus } from "../lib/docusignSync.js";
 
 export const adminUsersRouter = Router();
 
+// ---------------------------------------------------------------------------
+// Pagination helpers
+// ---------------------------------------------------------------------------
+
+function parsePagination(
+  query,
+  { pageKey = "page", limitKey = "limit", defaultLimit = 50, maxLimit = 100 } = {}
+) {
+  const page = Math.max(parseInt(query[pageKey], 10) || 1, 1);
+  const limit = Math.min(
+    Math.max(parseInt(query[limitKey], 10) || defaultLimit, 1),
+    maxLimit
+  );
+  return { page, limit, skip: (page - 1) * limit };
+}
+
+// Compact list of page buttons, e.g. [1, "…", 4, 5, 6, "…", 20]
+function getPageItems(page, totalPages) {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1);
+  const items = [1];
+  const start = Math.max(2, page - 1);
+  const end = Math.min(totalPages - 1, page + 1);
+  if (start > 2) items.push("…");
+  for (let i = start; i <= end; i++) items.push(i);
+  if (end < totalPages - 1) items.push("…");
+  items.push(totalPages);
+  return items;
+}
+
+function pageMeta(total, page, limit) {
+  const totalPages = Math.max(Math.ceil(total / limit), 1);
+  return {
+    total,
+    page,
+    limit,
+    totalPages,
+    hasNext: page < totalPages,
+    hasPrev: page > 1,
+    // Bottom pagination buttons: only needed when there is more than one page
+    showPagination: totalPages > 1,
+    prevPage: page > 1 ? page - 1 : null,
+    nextPage: page < totalPages ? page + 1 : null,
+    pages: getPageItems(page, totalPages),
+  };
+}
+
 // GET /api/admin/users — list all users (ADMIN+)
 adminUsersRouter.get("/", requireAdmin, async (req, res) => {
   try {
-    const { search, role, page = "1", limit = "50" } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { search, role } = req.query;
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 50 });
 
     const where = {
       AND: [
@@ -42,23 +88,31 @@ adminUsersRouter.get("/", requireAdmin, async (req, res) => {
           createdAt: true,
           _count: { select: { applications: true } },
         },
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
         skip,
-        take: parseInt(limit),
+        take: limit,
       }),
       prisma.user.count({ where }),
     ]);
 
-    return res.json({ users, total, page: parseInt(page) });
+    return res.json({ users, ...pageMeta(total, page, limit) });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to load users" });
   }
 });
 
-// GET /api/admin/users/:id — single user with applications
+// GET /api/admin/users/:id — single user with paginated applications
+// Query: ?appPage=1&appLimit=10
 adminUsersRouter.get("/:id", requireAdmin, async (req, res) => {
   try {
+    const { page, limit, skip } = parsePagination(req.query, {
+      pageKey: "appPage",
+      limitKey: "appLimit",
+      defaultLimit: 10,
+      maxLimit: 50,
+    });
+
     const user = await prisma.user.findUnique({
       where: { id: req.params.id },
       select: {
@@ -71,7 +125,11 @@ adminUsersRouter.get("/:id", requireAdmin, async (req, res) => {
         role: true,
         createdAt: true,
         updatedAt: true,
+        _count: { select: { applications: true } },
         applications: {
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          skip,
+          take: limit,
           include: {
             evidenceFiles: true,
             paymentEvents: { orderBy: { createdAt: "desc" } },
@@ -84,7 +142,12 @@ adminUsersRouter.get("/:id", requireAdmin, async (req, res) => {
 
     user.applications = await syncApplicationsDocusignStatus(user.applications);
 
-    return res.json({ user });
+    const { _count, ...rest } = user;
+
+    return res.json({
+      user: rest,
+      applicationsPagination: pageMeta(_count.applications, page, limit),
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to load user" });
@@ -276,11 +339,11 @@ adminUsersRouter.delete("/:id", requireSuperAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/audit-log (super admin only)
+// GET /api/admin/users/audit-log/all (super admin only)
 adminUsersRouter.get("/audit-log/all", requireSuperAdmin, async (req, res) => {
   try {
-    const { actorId, action, page = "1", limit = "50" } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { actorId, action } = req.query;
+    const { page, limit, skip } = parsePagination(req.query);
 
     const where = {
       AND: [
@@ -295,14 +358,14 @@ adminUsersRouter.get("/audit-log/all", requireSuperAdmin, async (req, res) => {
         include: {
           actor: { select: { id: true, firstName: true, lastName: true, email: true, role: true } },
         },
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
         skip,
-        take: parseInt(limit),
+        take: limit,
       }),
       prisma.auditLog.count({ where }),
     ]);
 
-    return res.json({ logs, total, page: parseInt(page) });
+    return res.json({ logs, ...pageMeta(total, page, limit) });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to load audit log" });
